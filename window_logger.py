@@ -38,6 +38,53 @@ except ModuleNotFoundError:  # pragma: no cover - very old python
 
 APP_NAME = "window-logger"
 
+# Stamped at bundle/install time when git isn't available at runtime (e.g. the
+# single-file deploy or an install.sh copy). Left empty in the source tree; the
+# primary deploy path is a git checkout, where the hash is read live instead.
+_EMBEDDED_VERSION = ""
+
+_version_cache = None
+
+
+def get_version() -> str:
+    """Resolve the tool version with no manual bumping:
+      1. live git hash of the checkout this file lives in (main path), else
+      2. a stamp embedded at bundle/install time, else
+      3. 'unknown'.
+    Format: '<shorthash>[+dirty] (YYYY-MM-DD)'."""
+    global _version_cache
+    if _version_cache is not None:
+        return _version_cache
+    _version_cache = _git_version() or _EMBEDDED_VERSION or "unknown"
+    return _version_cache
+
+
+def _git_version():
+    here = Path(__file__).resolve().parent
+
+    def run(*a):
+        try:
+            return subprocess.run(["git", "-C", str(here), *a],
+                                  capture_output=True, text=True, timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            return None
+    top = run("rev-parse", "--show-toplevel")
+    if not top or top.returncode != 0:
+        return None
+    # guard against picking up an unrelated ancestor repo (e.g. a $HOME repo)
+    if not (Path(top.stdout.strip()) / "window_logger.py").exists():
+        return None
+    h = run("rev-parse", "--short", "HEAD")
+    if not h or h.returncode != 0:
+        return None
+    short = h.stdout.strip()
+    st = run("status", "--porcelain")
+    dirty = "+dirty" if st and st.stdout.strip() else ""
+    d = run("show", "-s", "--format=%cs", "HEAD")
+    date = d.stdout.strip() if d and d.returncode == 0 else ""
+    return f"{short}{dirty}" + (f" ({date})" if date else "")
+
+
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
@@ -1026,10 +1073,14 @@ class Daemon:
 
     def run(self):
         self._install_signals()
-        logmsg(f"starting; host={self.hostname} log_dir={self.log_dir} "
+        ver = get_version()
+        logmsg(f"starting v{ver}; host={self.hostname} log_dir={self.log_dir} "
                f"config={self.config_source or '(defaults)'}")
         if self.cfg["power"].get("enabled", True):
             self._startup_power()
+        # Record which tool version produced this session's logs (for the auditor).
+        self.writer.write("STATUS", ["version",
+                                     f"{ver} python={_platform.python_version()}"])
 
         # wire callbacks
         self.window_source.on_update = self._on_window_update
@@ -1237,7 +1288,7 @@ def cmd_status(cfg, source, args):
 
     if getattr(args, "json", False):
         out = {
-            "verdict": verdict, "host": d.hostname,
+            "verdict": verdict, "host": d.hostname, "version": get_version(),
             "service": svc, "installed": installed,
             "last_log_at": last_ts.isoformat() if last_ts else None,
             "last_log_age_s": int(last_age) if last_age is not None else None,
@@ -1252,6 +1303,7 @@ def cmd_status(cfg, source, args):
         print(json.dumps(out, indent=2))
     else:
         print(f"[{mark}] {verdict}   host={d.hostname}")
+        print(f"  version:       {get_version()}")
         if svc is not None:
             print(f"  service:       {svc['active']} / {svc['enabled']}")
         print(f"  last log:      {_age_str(last_age)}"
@@ -1274,11 +1326,17 @@ def cmd_status(cfg, source, args):
     return 2 if problems else (1 if warns else 0)
 
 
+def cmd_version(cfg, source, args):
+    print(get_version())
+    return 0
+
+
 COMMANDS = {
     "run": cmd_run,
     "snapshot": cmd_snapshot,
     "upload": cmd_upload,
     "status": cmd_status,
+    "version": cmd_version,
 }
 
 
@@ -1291,7 +1349,12 @@ def main(argv=None):
                         help="(snapshot) also append the line to the audit log")
     parser.add_argument("--json", action="store_true",
                         help="(status) emit machine-readable JSON")
+    parser.add_argument("-V", "--version", action="store_true",
+                        help="print the tool version and exit")
     args = parser.parse_args(argv)
+    if args.version:
+        print(get_version())
+        return 0
     cfg, source = load_config(args.config)
     return COMMANDS[args.command](cfg, source, args)
 

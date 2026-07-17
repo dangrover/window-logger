@@ -23,14 +23,21 @@ warn() { printf '\033[1;33m warn:\033[0m %s\n' "$*" >&2; }
 
 # --- sanity checks ---
 command -v python3 >/dev/null || { echo "python3 is required"; exit 1; }
-command -v rsync   >/dev/null || warn "rsync not found — uploads will not work"
-command -v niri    >/dev/null || warn "niri not found — this client may be unsupported"
+command -v rsync   >/dev/null || warn "rsync not found - uploads will not work"
+command -v niri    >/dev/null || warn "niri not found - this client may be unsupported"
 command -v systemctl >/dev/null || { echo "systemd (systemctl) is required"; exit 1; }
 
 # --- install the daemon script ---
 say "Installing daemon -> $BIN"
 mkdir -p "$BIN_DIR"
 install -m 0755 "$SRC/window_logger.py" "$BIN"
+# Stamp the version if installing from a git checkout (the copy has no .git).
+# If the source was already stamped (e.g. the bundle), the "" pattern won't match.
+VER="$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || true)"
+if [[ -n "$VER" ]]; then
+  DATE="$(git -C "$SRC" show -s --format=%cs HEAD 2>/dev/null || true)"
+  sed -i "s|^_EMBEDDED_VERSION = \"\"|_EMBEDDED_VERSION = \"$VER ($DATE)\"|" "$BIN"
+fi
 
 # --- config ---
 mkdir -p "$CFG_DIR"
@@ -40,7 +47,7 @@ if [[ -f "$CFG" ]]; then
 else
   say "Creating config from example: $CFG"
   install -m 0600 "$SRC/config.example.toml" "$CFG"
-  warn "Edit $CFG — set [upload] destination and enable it when ready."
+  warn "Edit $CFG - set [upload] destination and enable it when ready."
 fi
 
 # --- ssh key for uploads ---

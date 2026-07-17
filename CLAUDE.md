@@ -44,6 +44,12 @@ R11. **Client-side log retention.** Prune local log files older than a configura
     `retain_days`, to bound disk use — **without** ever deleting them on the server (rsync
     is never run with `--delete`). Guarded by `require_sent` (default true): only files
     confirmed present on the server are eligible, so retention can't cause data loss.
+R12. **Automatic versioning + version logging.** The tool version is derived, never
+    manually bumped: live git short-hash of the checkout the daemon runs from (the primary
+    chezmoi deploy is a real git checkout), falling back to a stamp injected at
+    bundle/install time, else `unknown`. Logged as a `STATUS version ...` line at each
+    startup (auditor sees which version produced a session's logs) and exposed via
+    `window-logger version` / `--version` and in `status`.
 
 ## Target environment (initial client: `dgframework`)
 
@@ -143,6 +149,8 @@ Append dated entries here whenever scope shifts (newest last):
 - 2026-07-17 — **Removed `ignore_app_ids` and `redact_title_patterns` entirely.** Tool is for
   consensual monitoring between agreeing parties; faithful verbatim capture is the intent.
   No redaction/filtering knobs — see "Design philosophy". Do not reintroduce.
+- 2026-07-17 — Added R12 (automatic git-hash-based versioning + `STATUS version` startup
+  line; `version`/`--version` commands). No manual version bumps.
 - 2026-07-17 — Added R11 (client-side retention: prune local logs older than retain_days,
   server copies untouched, `require_sent` safety guard).
 - 2026-07-17 — Server (first client `dgframework`): dangrover@server.alder.dangrover.com,
