@@ -564,6 +564,69 @@ class LogindPowerSource(PowerSource):
 
 
 # --------------------------------------------------------------------------- #
+# Terminal-multiplexer enrichment - optional "mux" WINDOW field
+# --------------------------------------------------------------------------- #
+
+class MuxProbe:
+    """Resolve the focused tab of a terminal multiplexer for the optional "mux"
+    WINDOW column (enabled by adding "mux" to [capture] fields).
+
+    Trigger: the focused window is a terminal (app_id heuristic) AND its title
+    names a known mux -- terminals like ghostty put the foreground command in
+    the per-window title, so this only fires for the window actually showing
+    the mux. Best-effort enrichment: any failure yields an empty column.
+    Queries are cached briefly so bursts of WINDOW writes don't spawn a
+    subprocess each."""
+
+    CACHE_TTL = 2.0
+    PROGRAMS = ("herdr", "tmux")
+    TERMINALS = ("ghostty", "alacritty", "kitty", "foot", "wezterm", "konsole",
+                 "terminal", "xterm", "urxvt", "tilix")
+
+    def __init__(self):
+        self._cache = {}   # program -> (monotonic_ts, label)
+        # standalone word only: "herdr-design.docx" must not match "herdr"
+        self._res = {p: re.compile(rf"(?<![\w.-]){p}(?![\w.-])")
+                     for p in self.PROGRAMS}
+
+    def label_for(self, title: str, app_id: str) -> str:
+        low = app_id.lower()
+        if not any(t in low for t in self.TERMINALS):
+            return ""
+        for prog in self.PROGRAMS:
+            if self._res[prog].search(title):
+                return self._query(prog)
+        return ""
+
+    def _query(self, prog: str) -> str:
+        now = time.monotonic()
+        hit = self._cache.get(prog)
+        if hit and now - hit[0] < self.CACHE_TTL:
+            return hit[1]
+        label = ""
+        try:
+            if prog == "herdr":
+                # socket API: exactly one tab carries focused=true
+                out = subprocess.run(["herdr", "tab", "list"],
+                                     capture_output=True, text=True, timeout=1.5)
+                if out.returncode == 0:
+                    tabs = json.loads(out.stdout)["result"]["tabs"]
+                    foc = [t for t in tabs if t.get("focused")]
+                    if foc:
+                        label = f"herdr:{foc[0].get('label') or '?'}"
+            elif prog == "tmux":
+                # most recently active client's session:window
+                out = subprocess.run(["tmux", "display-message", "-p", "#S:#W"],
+                                     capture_output=True, text=True, timeout=1.5)
+                if out.returncode == 0 and out.stdout.strip():
+                    label = f"tmux:{out.stdout.strip()}"
+        except (subprocess.SubprocessError, OSError, ValueError, KeyError):
+            label = ""
+        self._cache[prog] = (now, label)
+        return label
+
+
+# --------------------------------------------------------------------------- #
 # Idle source backends (R13, R9)
 # --------------------------------------------------------------------------- #
 
@@ -1135,6 +1198,8 @@ class Daemon:
         self.uploader = Uploader(cfg["upload"], self.log_dir, self.hostname,
                                  retention=cfg["retention"])
 
+        self.mux_probe = MuxProbe()
+
         p = cfg["processes"]
         self.proc_sampler = ProcSampler(
             top_n=p["top_n"], sample_window=p["sample_window"],
@@ -1149,6 +1214,8 @@ class Daemon:
             title = title[: self.max_title] + "..."
         vals = {"app_id": snap.app_id or "(none)", "pid": snap.pid,
                 "title": title, "wid": snap.wid}
+        if "mux" in self.fields:
+            vals["mux"] = self.mux_probe.label_for(snap.title, snap.app_id or "")
         return [vals.get(f, "") for f in self.fields]
 
     def _write_window(self, snap: WindowSnapshot, now: float):

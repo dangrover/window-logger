@@ -140,7 +140,14 @@ Concretely, per an explicit 2026-07-17 decision by the user:
   (bundles everything into one self-contained deploy script for R3).
 
 Log line schema: `ISO8601±tz <TAB> {WINDOW|POWER|STATUS|PROCS} <TAB> …`.
-- WINDOW: configured fields in order (title last).
+- WINDOW: configured fields in order (title last). Optional `mux` field (off by
+          default; enabled by adding "mux" to `[capture] fields`): when the focused
+          window is a terminal (app_id heuristic, `MuxProbe.TERMINALS`) whose title
+          names a known terminal multiplexer as a standalone word, carries its focused tab
+          (`herdr:<tab-label>` via `herdr tab list`, `tmux:<session>:<window>` via
+          `tmux display-message`). Best-effort; empty when not applicable. Intra-mux
+          tab switches produce no compositor event, so they surface at the next
+          heartbeat.
 - POWER:  `event <TAB> detail`  (online/offline/suspend/resume/shutdown/lock/unlock/
           idle/active). The `online` detail always carries
           `boot=<iso> prior=<none|clean|unclean>` so each startup self-describes how
@@ -195,6 +202,10 @@ Append dated entries here whenever scope shifts (newest last):
   Kept only `since=` on the idle line (`timeout=` was redundant — user decision).
 - 2026-07-17 — Added `tail` subcommand (tail -f of the local audit log, follows daily
   rotation) — user request; was previously done by hand.
+- 2026-07-17 — Added optional `mux` WINDOW field (herdr/tmux focused-tab enrichment;
+  opt-in via `[capture] fields`). herdr has no terminal-title option, so its socket
+  API is queried; for tmux, `set -g set-titles on` remains the zero-config
+  alternative. Enabled on dgpc's real config.
 - 2026-07-17 — Multi-device deploy plan: chezmoi. `deploy/chezmoi/` manages config + unit as
   dotfiles and fetches the single-file daemon from GitHub via a chezmoi external (auto-update);
   a run_ hook does per-device keygen + restart-on-change. (User will roll this out later.)

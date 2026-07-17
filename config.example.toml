@@ -24,8 +24,12 @@ heartbeat_interval = 60
 title_debounce = 4.0
 # Truncate very long titles to this many characters.
 max_title_length = 500
-# Columns to emit per WINDOW line, in order. Available: app_id, pid, title, wid.
+# Columns to emit per WINDOW line, in order. Available: app_id, pid, title, wid, mux.
 # (timestamp + record type are always prepended; keep title last.)
+# "mux" is optional terminal-multiplexer enrichment: when the focused window's title
+# names a known multiplexer (herdr, tmux), the column carries its focused tab, e.g.
+# "herdr:window-logger" or "tmux:main:vim". Empty otherwise. Best-effort (queries the
+# mux's own CLI); intra-mux tab switches surface at the next heartbeat.
 fields = ["app_id", "pid", "title"]
 # Emit a line when nothing is focused (empty workspace, overview, etc.).
 log_no_focus = true
