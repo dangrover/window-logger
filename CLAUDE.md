@@ -123,7 +123,13 @@ Append dated entries here whenever scope shifts (newest last):
 - 2026-07-17 — Added R11 (client-side retention: prune local logs older than retain_days,
   server copies untouched, `require_sent` safety guard).
 - 2026-07-17 — Server (first client `dgframework`): dangrover@server.alder.dangrover.com,
-  logs to ~/window-logs/ (quick same-user setup, publicly reachable FQDN).
+  logs to ~/window-logs/ (quick same-user setup, publicly reachable FQDN). First real
+  upload verified end-to-end on 2026-07-17.
+- 2026-07-17 — `status` upgraded to a health check (service state, last-log staleness, last
+  transmission) with HEALTHY/WARN/UNHEALTHY verdict + matching exit code (0/1/2) and `--json`.
+- 2026-07-17 — Multi-device deploy plan: chezmoi. `deploy/chezmoi/` manages config + unit as
+  dotfiles and fetches the single-file daemon from GitHub via a chezmoi external (auto-update);
+  a run_ hook does per-device keygen + restart-on-change. (User will roll this out later.)
 
 ## Status
 

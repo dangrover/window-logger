@@ -1150,30 +1150,138 @@ def cmd_upload(cfg, source, args):
     return 0 if ok else 2
 
 
+def _age_str(seconds: float | None) -> str:
+    if seconds is None:
+        return "never"
+    s = int(seconds)
+    if s < 0:
+        s = 0
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m ago"
+    return f"{s // 86400}d ago"
+
+
+def _parse_iso(ts: str):
+    try:
+        return dt.datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+
+
+def _systemctl_state(unit: str):
+    """Return {'active':..., 'enabled':...} or None if systemctl is unavailable."""
+    if not shutil.which("systemctl"):
+        return None
+
+    def q(*a):
+        try:
+            return subprocess.run(["systemctl", "--user", *a, unit],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+        except (subprocess.SubprocessError, OSError):
+            return ""
+    return {"active": q("is-active") or "unknown", "enabled": q("is-enabled") or "unknown"}
+
+
 def cmd_status(cfg, source, args):
     d = Daemon(cfg, source)
-    print(f"host:        {d.hostname}")
-    print(f"config:      {source or '(defaults)'}")
-    print(f"log_dir:     {d.log_dir}")
-    print(f"platform:    {_platform.system()} / window={type(d.window_source).__name__}"
-          f" power={type(d.power_source).__name__}")
+    now = dt.datetime.now().astimezone()
+    problems, warns, notes = [], [], []
+
+    # --- service ---
+    svc = _systemctl_state("window-logger.service")
+    installed = svc is not None and "not-found" not in svc["enabled"] and svc["enabled"] != "unknown"
+    if svc is None:
+        notes.append("systemctl unavailable — cannot check service")
+    elif not installed:
+        notes.append("service not installed as a systemd unit (running manually?)")
+    elif svc["active"] != "active":
+        problems.append(f"service is {svc['active']} (expected active)")
+
+    # --- last log line + staleness ---
+    last = d.writer.last_line_across_logs()
+    last_ts = last_age = last_type = None
+    if last:
+        cols = last.split("\t")
+        last_type = cols[1] if len(cols) > 1 else "?"
+        pt = _parse_iso(cols[0])
+        if pt:
+            last_ts = pt
+            last_age = (now - pt).total_seconds()
+    hb = float(cfg["capture"]["heartbeat_interval"])
+    stale_after = hb * 2 + 60
+    running = installed and svc and svc["active"] == "active"
+    if last_age is None:
+        (problems if running else notes).append("no audit log written yet")
+    elif last_age > stale_after and running:
+        problems.append(f"last log is stale ({_age_str(last_age)}; heartbeat={int(hb)}s)")
+
+    # --- transmission ---
     up = cfg["upload"]
-    print(f"upload:      enabled={up.get('enabled')} dest={up.get('destination') or '-'}"
-          f" interval={up.get('interval')}s")
     man = d.uploader._load_manifest()
-    print(f"last_success:{man.get('last_success')}  last_error={man.get('last_error')}")
+    tx_age = None
+    if up.get("enabled"):
+        ls = _parse_iso(man.get("last_success") or "")
+        tx_age = (now - ls).total_seconds() if ls else None
+        interval = float(up.get("interval", 300))
+        if tx_age is None:
+            warns.append("uploads enabled but nothing transmitted yet")
+        elif tx_age > interval * 3 + 60:
+            warns.append(f"transmission behind (last success {_age_str(tx_age)})")
+        if man.get("last_error"):
+            warns.append(f"last upload error: {man['last_error']}")
+    else:
+        notes.append("upload disabled")
+
+    # --- file tallies ---
     files = man.get("files", {})
     logs = sorted(p.name for p in d.log_dir.glob(f"{d.hostname}-*.log") if p.is_file())
-    sent = sorted(p.name for p in (d.log_dir / 'sent').glob('*.log')) \
-        if (d.log_dir / 'sent').is_dir() else []
-    print(f"\nlocal log files ({len(logs)} pending, {len(sent)} sent):")
-    for name in logs:
-        st = files.get(name, {}).get("status", "pending")
-        size = (d.log_dir / name).stat().st_size
-        print(f"  [{st:<12}] {name}  ({size} bytes)")
-    for name in sent:
-        print(f"  [sent (moved)] sent/{name}")
-    return 0
+    sent = sorted(p.name for p in (d.log_dir / "sent").glob("*.log")) \
+        if (d.log_dir / "sent").is_dir() else []
+
+    verdict = "UNHEALTHY" if problems else ("WARN" if warns else "HEALTHY")
+    mark = {"HEALTHY": "✓", "WARN": "!", "UNHEALTHY": "✗"}[verdict]
+
+    if getattr(args, "json", False):
+        out = {
+            "verdict": verdict, "host": d.hostname,
+            "service": svc, "installed": installed,
+            "last_log_at": last_ts.isoformat() if last_ts else None,
+            "last_log_age_s": int(last_age) if last_age is not None else None,
+            "last_log_type": last_type,
+            "upload_enabled": bool(up.get("enabled")),
+            "last_transmission": man.get("last_success"),
+            "last_transmission_age_s": int(tx_age) if tx_age is not None else None,
+            "last_upload_error": man.get("last_error"),
+            "pending_files": len(logs), "sent_files": len(sent),
+            "problems": problems, "warnings": warns, "notes": notes,
+        }
+        print(json.dumps(out, indent=2))
+    else:
+        print(f"[{mark}] {verdict}   host={d.hostname}")
+        if svc is not None:
+            print(f"  service:       {svc['active']} / {svc['enabled']}")
+        print(f"  last log:      {_age_str(last_age)}"
+              + (f"  ({last_type}, {last_ts.isoformat(timespec='seconds')})" if last_ts else ""))
+        if up.get("enabled"):
+            print(f"  last transmit: {_age_str(tx_age)}"
+                  + (f"  ({man.get('last_success')})" if man.get("last_success") else "")
+                  + (f"   error: {man['last_error']}" if man.get("last_error") else ""))
+            print(f"  destination:   {up.get('destination')}")
+        else:
+            print("  upload:        disabled")
+        print(f"  files:         {len(logs)} pending, {len(sent)} sent   log_dir={d.log_dir}")
+        for msg in problems:
+            print(f"  ✗ {msg}")
+        for msg in warns:
+            print(f"  ! {msg}")
+        for msg in notes:
+            print(f"  · {msg}")
+
+    return 2 if problems else (1 if warns else 0)
 
 
 COMMANDS = {
@@ -1191,6 +1299,8 @@ def main(argv=None):
     parser.add_argument("-c", "--config", help="path to config.toml")
     parser.add_argument("--append", action="store_true",
                         help="(snapshot) also append the line to the audit log")
+    parser.add_argument("--json", action="store_true",
+                        help="(status) emit machine-readable JSON")
     args = parser.parse_args(argv)
     cfg, source = load_config(args.config)
     return COMMANDS[args.command](cfg, source, args)

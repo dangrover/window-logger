@@ -58,6 +58,11 @@ Or ship a single self-contained script to each client:
 scp dist/window-logger-deploy.sh client:/tmp/ && ssh client 'bash /tmp/window-logger-deploy.sh'
 ```
 
+**Fleet / multi-device with chezmoi:** see [`deploy/chezmoi/`](deploy/chezmoi/) — it manages
+the config + systemd unit as dotfiles and pulls the latest single-file daemon straight from
+this GitHub repo via a chezmoi *external*, so `chezmoi update` keeps every device on the
+newest code and restarts the service only when the binary actually changed.
+
 The installer:
 - installs the daemon to `~/.local/bin/window-logger`,
 - writes `~/.config/window-logger/config.toml` (from the example, if absent),
@@ -112,8 +117,28 @@ window-logger run                # the daemon (what systemd runs)
 window-logger snapshot           # print one WINDOW line for the current focus (print-only)
 window-logger snapshot --append  # ...and also append it to the audit log
 window-logger upload             # run one upload cycle now
-window-logger status             # resolved config + per-file transmission state
+window-logger status             # health check (see below)
+window-logger status --json      # same, machine-readable
 ```
+
+### Health check
+
+`window-logger status` is the quick "is this client OK?" command. It reports a one-line
+verdict plus service state, how stale the last log is, and the last successful transmission:
+
+```
+[✓] HEALTHY   host=dgframework
+  service:       active / enabled
+  last log:      8s ago  (WINDOW, 2026-07-17T09:12:03-07:00)
+  last transmit: 2m ago  (2026-07-17T09:10:01-07:00)
+  destination:   dangrover@server.alder.dangrover.com:window-logs/
+  files:         1 pending, 12 sent   log_dir=~/.local/share/window-logger/logs
+```
+
+Verdict is `HEALTHY` / `WARN` / `UNHEALTHY`, and the **exit code matches** (0 / 1 / 2) so you
+can drop it in monitoring: `window-logger status >/dev/null || alert`. It flags a stopped
+service, a stale log (older than 2× heartbeat), uploads falling behind, or the last upload
+error. `--json` emits the same data for scripting.
 
 `snapshot` is print-only by default so this debugging command never leaves a stray line in
 the audit log (which would otherwise look like an unclean session on the next start).

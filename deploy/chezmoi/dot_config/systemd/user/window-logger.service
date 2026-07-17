@@ -1,0 +1,16 @@
+[Unit]
+Description=window-logger (focused-window + power/presence logger)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# %h = the user's home dir, so this unit is identical on every device (chezmoi-friendly).
+ExecStart=%h/.local/bin/window-logger run --config %h/.config/window-logger/config.toml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=graphical-session.target

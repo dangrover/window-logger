@@ -1,0 +1,15 @@
+# Pull the latest single-file daemon straight from GitHub on each `chezmoi update`.
+# Because window_logger.py is fully self-contained, one "file" external is all we need.
+#
+# This file lives at the chezmoi SOURCE ROOT, so the entry paths below are relative to
+# the destination root (~). It installs the daemon to ~/.local/bin/window-logger.
+#
+# Pin to a branch (always-latest) or a tag (stable). Branch shown here.
+# refreshPeriod controls how stale a cached copy may get before chezmoi re-fetches;
+# force an immediate refresh with:  chezmoi apply --refresh-externals
+
+[".local/bin/window-logger"]
+    type = "file"
+    url = "https://raw.githubusercontent.com/dangrover/window-logger/master/window_logger.py"
+    executable = true
+    refreshPeriod = "24h"
