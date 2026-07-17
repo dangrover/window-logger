@@ -68,6 +68,7 @@ DEFAULTS = {
         "interval": 60,                # seconds between PROCS samples
         "top_n": 15,
         "sample_window": 0.5,          # seconds; CPU measured over this window (top-style)
+        "normalize": True,             # True: 0-100% of whole machine; False: top/Irix (per-core sum)
         "include_cmdline": False,      # append a truncated cmdline (may contain secrets)
         "cmdline_max_length": 80,
     },
@@ -513,13 +514,15 @@ class ProcSampler:
     a short window. Platform-specific (Linux /proc); a macOS backend would go behind the
     same interface later (R9)."""
 
-    def __init__(self, top_n=15, sample_window=0.5, include_cmdline=False,
-                 cmdline_max_length=80):
+    def __init__(self, top_n=15, sample_window=0.5, normalize=True,
+                 include_cmdline=False, cmdline_max_length=80):
         self.top_n = int(top_n)
         self.sample_window = float(sample_window)
+        self.normalize = bool(normalize)
         self.include_cmdline = bool(include_cmdline)
         self.cmdline_max = int(cmdline_max_length)
         self.clk_tck = os.sysconf("SC_CLK_TCK")
+        self.ncpu = os.cpu_count() or 1
 
     @staticmethod
     def _read_stat(pid: str):
@@ -574,6 +577,8 @@ class ProcSampler:
             if dj <= 0:
                 continue
             cpu = dj / (self.clk_tck * self.sample_window) * 100.0
+            if self.normalize:
+                cpu /= self.ncpu
             results.append((cpu, pid, comm))
         results.sort(reverse=True)
         tokens = []
@@ -810,7 +815,7 @@ class Daemon:
         p = cfg["processes"]
         self.proc_sampler = ProcSampler(
             top_n=p["top_n"], sample_window=p["sample_window"],
-            include_cmdline=p["include_cmdline"],
+            normalize=p["normalize"], include_cmdline=p["include_cmdline"],
             cmdline_max_length=p["cmdline_max_length"])
         self._threads: list[threading.Thread] = []
 

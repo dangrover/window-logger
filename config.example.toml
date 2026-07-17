@@ -55,6 +55,9 @@ interval = 60
 top_n = 15
 # CPU is measured over this short window each sample (top-style). Larger = smoother.
 sample_window = 0.5
+# true  = 0-100% of the whole machine (divided by core count).
+# false = top/Irix style: summed across cores, so a busy process can read >100%.
+normalize = true
 # Append a truncated command line to each entry. Off by default: cmdlines can leak
 # secrets (tokens, passwords passed as args).
 include_cmdline = false
