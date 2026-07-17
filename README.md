@@ -108,11 +108,15 @@ and restart: `systemctl --user restart window-logger.service`.
 ## Commands
 
 ```bash
-window-logger run        # the daemon (what systemd runs)
-window-logger snapshot   # print + append one WINDOW line for the current focus
-window-logger upload     # run one upload cycle now
-window-logger status     # resolved config + per-file transmission state
+window-logger run                # the daemon (what systemd runs)
+window-logger snapshot           # print one WINDOW line for the current focus (print-only)
+window-logger snapshot --append  # ...and also append it to the audit log
+window-logger upload             # run one upload cycle now
+window-logger status             # resolved config + per-file transmission state
 ```
+
+`snapshot` is print-only by default so this debugging command never leaves a stray line in
+the audit log (which would otherwise look like an unclean session on the next start).
 
 ## Configuration
 

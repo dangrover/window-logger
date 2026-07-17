@@ -888,21 +888,41 @@ class Daemon:
             self.writer.write("STATUS", ["window-source-unavailable", detail])
 
     def _startup_power(self):
-        # Inspect the PREVIOUS session's final line BEFORE writing anything this run.
-        unclean_last = None
+        # Classify how the PREVIOUS session ended, BEFORE writing anything this run.
+        # prior: None (detection off), "none" (no prior log), "clean", or "unclean".
+        prior = None
+        last_ts = None
+        last_event = None
         if self.cfg["power"].get("detect_unclean_shutdown", True):
             last = self.writer.last_line_across_logs()
-            if last:
+            if last is None:
+                prior = "none"          # no prior log at all -> fresh client / first run
+            else:
                 cols = last.split("\t")
-                clean = len(cols) >= 3 and cols[1] == "POWER" and cols[2] in (
-                    "offline", "shutdown", "suspend")
-                if not clean:
-                    unclean_last = cols[0]
+                if len(cols) >= 2:
+                    last_ts = cols[0]
+                    typ = cols[1]
+                    if typ in ("POWER", "STATUS") and len(cols) >= 3:
+                        last_event = f"{typ}:{cols[2]}"
+                    else:
+                        last_event = typ
+                    clean = (typ == "POWER" and len(cols) >= 3
+                             and cols[2] in ("offline", "shutdown", "suspend"))
+                    prior = "clean" if clean else "unclean"
+                else:
+                    last_event = "unparseable"
+                    prior = "unclean"
+
         boot = boot_time_iso()
-        self.writer.write("POWER", ["online", f"boot={boot}" if boot else "boot=?"])
-        if unclean_last is not None:
-            self.writer.write("STATUS",
-                              ["previous-session-unclean", f"last={unclean_last}"])
+        detail = f"boot={boot}" if boot else "boot=?"
+        if prior is not None:
+            detail += f" prior={prior}"
+        self.writer.write("POWER", ["online", detail])
+
+        if prior == "unclean":
+            self.writer.write(
+                "STATUS",
+                ["previous-session-unclean", f"last={last_ts} last_event={last_event}"])
 
     # ---- process sampling loop (R10) ----
     def _process_loop(self):
@@ -1026,24 +1046,27 @@ def select_power_source(power_cfg: dict) -> PowerSource:
 # Subcommands
 # --------------------------------------------------------------------------- #
 
-def cmd_run(cfg, source):
+def cmd_run(cfg, source, args):
     Daemon(cfg, source).run()
     return 0
 
 
-def cmd_snapshot(cfg, source):
+def cmd_snapshot(cfg, source, args):
+    # Print-only by default so this debugging command never pollutes the audit log
+    # (a lone appended line would look like an unclean session on the next start).
     d = Daemon(cfg, source)
     snap = d.window_source.current()
-    cols = ["WINDOW"] + [sanitize_field(x) for x in d._format_window(snap)]
-    ts = now_iso()
-    line = "\t".join([ts] + cols)
+    fields = d._format_window(snap)
+    line = "\t".join([now_iso(), "WINDOW"] + [sanitize_field(x) for x in fields])
     print(line)
-    d.writer.write("WINDOW", d._format_window(snap))
+    if getattr(args, "append", False):
+        d.writer.write("WINDOW", fields)
+        print("(appended to audit log)", file=sys.stderr)
     d.writer.close()
     return 0
 
 
-def cmd_upload(cfg, source):
+def cmd_upload(cfg, source, args):
     d = Daemon(cfg, source)
     if not cfg["upload"].get("enabled"):
         print("upload is disabled in config ([upload] enabled = false)")
@@ -1053,7 +1076,7 @@ def cmd_upload(cfg, source):
     return 0 if ok else 2
 
 
-def cmd_status(cfg, source):
+def cmd_status(cfg, source, args):
     d = Daemon(cfg, source)
     print(f"host:        {d.hostname}")
     print(f"config:      {source or '(defaults)'}")
@@ -1092,9 +1115,11 @@ def main(argv=None):
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", nargs="?", default="run", choices=list(COMMANDS))
     parser.add_argument("-c", "--config", help="path to config.toml")
+    parser.add_argument("--append", action="store_true",
+                        help="(snapshot) also append the line to the audit log")
     args = parser.parse_args(argv)
     cfg, source = load_config(args.config)
-    return COMMANDS[args.command](cfg, source)
+    return COMMANDS[args.command](cfg, source, args)
 
 
 if __name__ == "__main__":

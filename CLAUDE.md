@@ -91,7 +91,11 @@ R10. **Top-N processes by CPU.** Periodically log the top-N (default 15) process
 Log line schema: `ISO8601±tz <TAB> {WINDOW|POWER|STATUS|PROCS} <TAB> …`.
 - WINDOW: configured fields in order (title last).
 - POWER:  `event <TAB> detail`  (online/offline/suspend/resume/shutdown/lock/unlock).
-- STATUS: `event <TAB> detail`  (previous-session-unclean, window-source-unavailable, …).
+          The `online` detail always carries `boot=<iso> prior=<none|clean|unclean>` so
+          each startup self-describes how the previous session ended.
+- STATUS: `event <TAB> detail`. `previous-session-unclean` fires only when prior=unclean
+          and is qualified with `last=<ts> last_event=<TYPE[:subtype]>`. Also
+          window-source-unavailable/recovered, power-source-unavailable.
 - PROCS:  space-joined `comm:pid:cpu%` tokens (optionally `:cmdline`).
 
 ## Requirement changes
@@ -106,6 +110,10 @@ Append dated entries here whenever scope shifts (newest last):
 - 2026-07-17 — Added R10 (top-N processes by CPU) + env-var override for all options.
 - 2026-07-17 — Decided: server auth is SSH key (dedicated per-client key, least-privilege
   `rrsync` in authorized_keys). Password auth rejected (no secure non-interactive path).
+- 2026-07-17 — Refined unclean-shutdown detection: startup always classifies the prior
+  session as none/clean/unclean (annotated on the `online` line); the unclean STATUS line
+  is qualified with the last event. `snapshot` is now print-only by default (add `--append`)
+  so it never pollutes the audit log / trips the detector.
 
 ## Status
 
