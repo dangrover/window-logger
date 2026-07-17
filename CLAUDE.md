@@ -140,7 +140,8 @@ Concretely, per an explicit 2026-07-17 decision by the user:
   (bundles everything into one self-contained deploy script for R3).
 
 Log line schema: `ISO8601±tz <TAB> {WINDOW|POWER|STATUS|PROCS} <TAB> …`.
-- WINDOW: configured fields in order (title last). Optional `mux` field (off by
+- WINDOW: configured fields in order (title last of the standard fields; the optional
+          `mux` column conventionally goes after title). Optional `mux` field (off by
           default; enabled by adding "mux" to `[capture] fields`): when the focused
           window is a terminal (app_id heuristic, `MuxProbe.TERMINALS`) whose title
           names a known terminal multiplexer as a standalone word, carries its focused tab
