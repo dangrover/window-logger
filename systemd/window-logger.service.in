@@ -1,0 +1,22 @@
+[Unit]
+Description=window-logger (focused-window + power/presence logger)
+Documentation=file:%h/.config/window-logger/config.toml
+# Start once the graphical session (niri) is up, and stop with it.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@BIN@ run --config @CONFIG@
+Restart=on-failure
+RestartSec=5
+# Allow time to write the clean "offline" marker when the session/machine stops.
+TimeoutStopSec=15
+KillSignal=SIGTERM
+# Light hardening (user service; still needs network + runtime dir for niri socket).
+NoNewPrivileges=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+
+[Install]
+WantedBy=graphical-session.target

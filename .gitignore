@@ -1,0 +1,25 @@
+# Real config & secrets (only *.example.* is tracked)
+config.toml
+*.local.toml
+/secrets/
+*.key
+id_*
+known_hosts
+
+# Logs produced by the daemon
+*.log
+/logs/
+/var/
+
+# Generated deploy bundle (build with ./build-deploy.sh)
+/dist/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / OS
+*.swp
+.DS_Store
