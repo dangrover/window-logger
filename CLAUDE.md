@@ -39,6 +39,10 @@ R9. **Platform-agnostic design (future-proofing).** Window capture and power cap
 R10. **Top-N processes by CPU.** Periodically log the top-N (default 15) processes by CPU,
     at a customizable interval, enabled by default. Every option is addressable via config
     **and** environment variable (`WINDOW_LOGGER_<SECTION>_<KEY>`).
+R11. **Client-side log retention.** Prune local log files older than a configurable
+    `retain_days`, to bound disk use — **without** ever deleting them on the server (rsync
+    is never run with `--delete`). Guarded by `require_sent` (default true): only files
+    confirmed present on the server are eligible, so retention can't cause data loss.
 
 ## Target environment (initial client: `dgframework`)
 
@@ -114,6 +118,12 @@ Append dated entries here whenever scope shifts (newest last):
   session as none/clean/unclean (annotated on the `online` line); the unclean STATUS line
   is qualified with the last event. `snapshot` is now print-only by default (add `--append`)
   so it never pollutes the audit log / trips the detector.
+- 2026-07-17 — Decisions from live testing: keep full window titles (no redaction); PROCS
+  CPU normalized to 0-100% of machine by default (`[processes] normalize`).
+- 2026-07-17 — Added R11 (client-side retention: prune local logs older than retain_days,
+  server copies untouched, `require_sent` safety guard).
+- 2026-07-17 — Server (first client `dgframework`): dangrover@server.alder.dangrover.com,
+  logs to ~/window-logs/ (quick same-user setup, publicly reachable FQDN).
 
 ## Status
 

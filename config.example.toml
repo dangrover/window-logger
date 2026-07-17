@@ -63,6 +63,16 @@ normalize = true
 include_cmdline = false
 cmdline_max_length = 80
 
+[retention]
+# Prune old LOCAL log files to bound disk use. This NEVER deletes anything on the
+# server: rsync is never run with --delete, so removing a local file has no remote effect.
+enabled = true
+# Delete local log files older than this many days.
+retain_days = 30
+# SAFETY: only delete files confirmed present on the server (status "sent"). Leave true
+# unless you truly want local logs discarded regardless of upload state.
+require_sent = true
+
 [upload]
 # Master switch. Leave false until the destination + key are set up.
 enabled = false

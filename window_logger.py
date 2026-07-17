@@ -72,6 +72,11 @@ DEFAULTS = {
         "include_cmdline": False,      # append a truncated cmdline (may contain secrets)
         "cmdline_max_length": 80,
     },
+    "retention": {
+        "enabled": True,               # prune old LOCAL logs (never touches the server)
+        "retain_days": 30,             # delete local files older than this many days
+        "require_sent": True,          # SAFETY: only delete files confirmed on the server
+    },
     "upload": {
         "enabled": False,              # off until a destination is configured
         "interval": 300,               # seconds between upload cycles
@@ -598,8 +603,9 @@ class ProcSampler:
 # --------------------------------------------------------------------------- #
 
 class Uploader:
-    def __init__(self, cfg: dict, log_dir: Path, hostname: str):
+    def __init__(self, cfg: dict, log_dir: Path, hostname: str, retention: dict | None = None):
         self.cfg = cfg
+        self.retention = retention or {}
         self.log_dir = log_dir
         self.hostname = hostname
         self.sent_dir = log_dir / "sent"
@@ -770,6 +776,59 @@ class Uploader:
             moved += 1
         return moved
 
+    @staticmethod
+    def _file_date(name: str):
+        m = re.search(r"-(\d{4})-(\d{2})-(\d{2})\.log$", name)
+        if not m:
+            return None
+        try:
+            return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+
+    def apply_retention(self) -> int:
+        """Delete LOCAL log files older than retain_days. Because rsync never runs with
+        --delete, this never affects the server. With require_sent (default), only files
+        confirmed present on the server are eligible — so nothing is ever lost (R11).
+        Returns the number of files pruned."""
+        ret = self.retention
+        if not ret.get("enabled", False):
+            return 0
+        retain_days = int(ret.get("retain_days", 30))
+        require_sent = ret.get("require_sent", True)
+        today = dt.date.today()
+        with self._lock:
+            man = self._load_manifest()
+            files = man.setdefault("files", {})
+            pruned = 0
+            # candidates: closed files in sent/ and in the log dir top level
+            candidates = list(self.sent_dir.glob(f"{self.hostname}-*.log")) \
+                if self.sent_dir.is_dir() else []
+            candidates += list(self.log_dir.glob(f"{self.hostname}-*.log"))
+            for path in candidates:
+                name = path.name
+                fdate = self._file_date(name)
+                if fdate is None or not self._is_closed(name):
+                    continue  # never today's / open file
+                if (today - fdate).days <= retain_days:
+                    continue
+                rec = files.get(name, {})
+                confirmed = rec.get("status") == "sent" or path.parent == self.sent_dir
+                if require_sent and not confirmed:
+                    continue  # SAFETY: not yet on the server -> keep it
+                try:
+                    path.unlink()
+                except OSError as e:
+                    logmsg(f"retention: could not delete {name}: {e}")
+                    continue
+                rec = files.setdefault(name, {})
+                rec["status"] = "pruned-local"
+                rec["pruned_at"] = now_iso()
+                pruned += 1
+            if pruned:
+                self._save_manifest(man)
+            return pruned
+
     def backoff_seconds(self) -> float:
         base = float(self.cfg["interval"])
         if self._failures == 0:
@@ -810,7 +869,8 @@ class Daemon:
 
         self.window_source = select_window_source()
         self.power_source = select_power_source(cfg["power"])
-        self.uploader = Uploader(cfg["upload"], self.log_dir, self.hostname)
+        self.uploader = Uploader(cfg["upload"], self.log_dir, self.hostname,
+                                 retention=cfg["retention"])
 
         p = cfg["processes"]
         self.proc_sampler = ProcSampler(
@@ -956,6 +1016,12 @@ class Daemon:
         while not self.stop_event.is_set():
             ok, msg = self.uploader.upload_once()
             logmsg(f"upload: {msg}")
+            try:
+                pruned = self.uploader.apply_retention()
+                if pruned:
+                    logmsg(f"retention: pruned {pruned} old local log file(s)")
+            except Exception as e:  # noqa: BLE001 - keep daemon alive
+                logmsg(f"retention failed: {e}")
             wait_s = self.uploader.backoff_seconds()
             if self.stop_event.wait(wait_s):
                 break
@@ -1078,6 +1144,9 @@ def cmd_upload(cfg, source, args):
         return 1
     ok, msg = d.uploader.upload_once()
     print(f"upload {'ok' if ok else 'FAILED'}: {msg}")
+    pruned = d.uploader.apply_retention()
+    if pruned:
+        print(f"retention: pruned {pruned} old local log file(s)")
     return 0 if ok else 2
 
 
