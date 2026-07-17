@@ -2,16 +2,18 @@
 """window-logger - log the focused window and power/presence events to per-host text
 logs, and sync them to a server with rsync.
 
-Single-file daemon. Requirements are tracked in CLAUDE.md (R1-R9).
+Single-file daemon. Requirements are tracked in CLAUDE.md (R1-R13).
 
-Backends are platform-abstracted (WindowSource / PowerSource) so other platforms
-(e.g. macOS) can be added later; only the Linux (niri + logind) backends ship today.
+Backends are platform-abstracted (WindowSource / PowerSource / IdleSource) so other
+platforms (e.g. macOS) can be added later; only the Linux (niri + logind + Wayland
+ext-idle-notify) backends ship today.
 
 Subcommands:
     run       Run the daemon (default; used by the systemd service).
     snapshot  Write/print a single WINDOW line for the current focus, then exit.
     upload    Run one upload cycle now, then exit.
     status    Print resolved config and per-file transmission state.
+    tail      Print the tail of the local audit log and follow it (across rotation).
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ import select
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -107,6 +110,11 @@ DEFAULTS = {
         "log_shutdown": True,
         "log_lock_unlock": False,      # off by default (noise/privacy)
         "detect_unclean_shutdown": True,
+    },
+    "idle": {
+        "enabled": True,               # log user idle/active transitions (R13)
+        "timeout": 300,                # seconds without input before "idle"
+        "mode": "inhibitor-aware",     # or "input-only" (ignore idle inhibitors)
     },
     "processes": {
         "enabled": True,               # log top-N processes by CPU (R10)
@@ -556,6 +564,205 @@ class LogindPowerSource(PowerSource):
 
 
 # --------------------------------------------------------------------------- #
+# Idle source backends (R13, R9)
+# --------------------------------------------------------------------------- #
+
+class IdleSource:
+    """Abstract user-idle source. Calls self.on_event("idle"|"active", detail) on
+    presence transitions and self.on_backend_status(up, detail) on availability."""
+
+    def __init__(self):
+        self.on_event = lambda event, detail: None
+        self.on_backend_status = lambda up, detail: None
+
+    def start(self, stop_event: threading.Event):
+        raise NotImplementedError
+
+
+def ensure_wayland_display():
+    """Under systemd the graphical-session env may not be imported, so
+    WAYLAND_DISPLAY can be unset. Recover it from the niri socket name
+    (niri.<display>.<pid>.sock), else the newest wayland-* runtime socket."""
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return
+    ensure_niri_socket()
+    m = re.match(r"niri\.(.+)\.\d+\.sock$",
+                 Path(os.environ.get("NIRI_SOCKET", "")).name)
+    if m:
+        os.environ["WAYLAND_DISPLAY"] = m.group(1)
+        return
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    try:
+        socks = sorted((p for p in Path(runtime).glob("wayland-*")
+                        if not p.name.endswith(".lock")),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        socks = []
+    if socks:
+        os.environ["WAYLAND_DISPLAY"] = socks[0].name
+
+
+class WaylandIdleSource(IdleSource):
+    """User idle/active via the Wayland ext-idle-notify-v1 protocol, spoken
+    directly over the compositor socket (pure stdlib; no wayland library).
+
+    Emits ("idle", "since=<iso>") once no input has arrived for `timeout`
+    seconds -- the compositor fires at timeout expiry, so `since` back-dates to
+    when input actually stopped -- and ("active", "idle_for=<N>s") on the next
+    input. `mode` picks the notification flavor: "inhibitor-aware" (an idle
+    inhibitor held by e.g. video playback keeps the session active) or
+    "input-only" (raw input silence; needs protocol v2, else falls back).
+    `timeout`/`mode` are re-read each cycle, so SIGHUP reloads apply live.
+    """
+
+    IFACE = "ext_idle_notifier_v1"
+
+    def __init__(self, timeout=300, mode="inhibitor-aware"):
+        super().__init__()
+        self.timeout = float(timeout)
+        self.mode = str(mode)
+        self._idle_since = None   # wall clock when input stopped, while idle
+
+    # --- wire helpers ---
+    @staticmethod
+    def _wmsg(obj: int, opcode: int, payload: bytes = b"") -> bytes:
+        return struct.pack("<II", obj, ((8 + len(payload)) << 16) | opcode) + payload
+
+    @staticmethod
+    def _wstr(s: str) -> bytes:
+        b = s.encode() + b"\0"
+        return struct.pack("<I", len(b)) + b + b"\0" * ((-len(b)) % 4)
+
+    def _connect(self) -> socket.socket:
+        ensure_wayland_display()
+        display = os.environ.get("WAYLAND_DISPLAY")
+        if not display:
+            raise OSError("WAYLAND_DISPLAY unset and no wayland socket found")
+        runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        path = display if display.startswith("/") else os.path.join(runtime, display)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(path)
+        except OSError:
+            s.close()
+            raise
+        return s
+
+    def start(self, stop_event: threading.Event):
+        backoff = 1
+        announced_down = False
+        while not stop_event.is_set():
+            try:
+                sock = self._connect()
+            except OSError as e:
+                if not announced_down:
+                    self.on_backend_status(False, str(e)[:150])
+                    announced_down = True
+                stop_event.wait(min(backoff, 30))
+                backoff = min(backoff * 2, 30)
+                continue
+            if announced_down:
+                self.on_backend_status(True, "")
+                announced_down = False
+            backoff = 1
+            try:
+                self._listen(sock, stop_event)
+            except OSError as e:
+                logmsg(f"idle source connection lost: {e}")
+            finally:
+                sock.close()
+            if not stop_event.is_set():
+                if not announced_down:
+                    self.on_backend_status(False, "connection lost")
+                    announced_down = True
+                stop_event.wait(1)
+
+    def _listen(self, sock: socket.socket, stop_event: threading.Event):
+        REG, SYNC = 2, 3
+        sock.sendall(self._wmsg(1, 1, struct.pack("<I", REG))       # get_registry
+                     + self._wmsg(1, 0, struct.pack("<I", SYNC)))   # sync
+        registry: dict = {}       # interface -> (name, version)
+        seat_id = notifier_id = note_id = prev_note_id = 0
+        notifier_ver = 1
+        next_id = 4
+        armed = (None, None)      # (timeout, mode) the notification was created with
+        buf = b""
+        sock.settimeout(1.0)
+        while not stop_event.is_set():
+            # (Re)arm when bound and the tunables changed (startup + SIGHUP reload).
+            if notifier_id and armed != (self.timeout, self.mode):
+                if note_id:
+                    sock.sendall(self._wmsg(note_id, 0))            # destroy old
+                    prev_note_id = note_id
+                armed = (self.timeout, self.mode)
+                want_input = armed[1] == "input-only"
+                if want_input and notifier_ver < 2:
+                    logmsg("idle mode=input-only needs ext-idle-notify v2; "
+                           "falling back to inhibitor-aware")
+                note_id = next_id
+                next_id += 1
+                op = 2 if want_input and notifier_ver >= 2 else 1
+                sock.sendall(self._wmsg(
+                    notifier_id, op,
+                    struct.pack("<III", note_id,
+                                max(1000, int(armed[0] * 1000)), seat_id)))
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                continue
+            if not chunk:
+                raise OSError("compositor closed the connection")
+            buf += chunk
+            while len(buf) >= 8:
+                obj, sizeop = struct.unpack_from("<II", buf, 0)
+                size, opcode = sizeop >> 16, sizeop & 0xFFFF
+                if size < 8:
+                    raise OSError("malformed wayland message")
+                if len(buf) < size:
+                    break
+                payload = buf[8:size]
+                buf = buf[size:]
+                if obj == REG and opcode == 0:       # wl_registry.global
+                    name, slen = struct.unpack_from("<II", payload, 0)
+                    iface = payload[8:8 + slen - 1].decode("utf-8", "replace")
+                    ver = struct.unpack_from("<I", payload, 8 + ((slen + 3) & ~3))[0]
+                    registry[iface] = (name, ver)
+                elif obj == SYNC and opcode == 0:    # initial burst done -> bind
+                    if self.IFACE not in registry or "wl_seat" not in registry:
+                        raise OSError(f"compositor does not expose {self.IFACE}")
+                    name, _ = registry["wl_seat"]
+                    seat_id = next_id
+                    next_id += 1
+                    sock.sendall(self._wmsg(REG, 0, struct.pack("<I", name)
+                                            + self._wstr("wl_seat")
+                                            + struct.pack("<II", 1, seat_id)))
+                    name, ver = registry[self.IFACE]
+                    notifier_ver = min(ver, 2)
+                    notifier_id = next_id
+                    next_id += 1
+                    sock.sendall(self._wmsg(REG, 0, struct.pack("<I", name)
+                                            + self._wstr(self.IFACE)
+                                            + struct.pack("<II", notifier_ver,
+                                                          notifier_id)))
+                elif obj and obj in (note_id, prev_note_id):
+                    if opcode == 0 and self._idle_since is None:        # idled
+                        self._idle_since = time.time() - armed[0]
+                        since = dt.datetime.fromtimestamp(
+                            self._idle_since).astimezone().isoformat(
+                            timespec="seconds")
+                        self.on_event("idle", f"since={since}")
+                    elif opcode == 1 and self._idle_since is not None:  # resumed
+                        secs = int(round(time.time() - self._idle_since))
+                        self._idle_since = None
+                        self.on_event("active", f"idle_for={secs}s")
+                elif obj == 1 and opcode == 0:       # wl_display.error
+                    eobj, ecode, slen = struct.unpack_from("<III", payload, 0)
+                    emsg = payload[12:12 + slen - 1].decode("utf-8", "replace")
+                    raise OSError(f"wayland error {ecode} on object {eobj}: {emsg}")
+                # anything else (seat capabilities, delete_id, ...) is ignored
+
+
+# --------------------------------------------------------------------------- #
 # Process sampler - top-N by CPU (R10)
 # --------------------------------------------------------------------------- #
 
@@ -891,14 +1098,18 @@ class Uploader:
 # Daemon orchestration
 # --------------------------------------------------------------------------- #
 
+def resolve_host_and_log_dir(cfg: dict) -> tuple[str, Path]:
+    g = cfg["general"]
+    hostname = (g.get("hostname") or socket.gethostname()).strip()
+    hostname = re.sub(r"[^A-Za-z0-9_.-]", "_", hostname) or "unknown-host"
+    return hostname, Path(g["log_dir"]).expanduser()
+
+
 class Daemon:
     def __init__(self, cfg: dict, config_source: str | None):
         self.cfg = cfg
         self.config_source = config_source
-        g = cfg["general"]
-        self.hostname = (g.get("hostname") or socket.gethostname()).strip()
-        self.hostname = re.sub(r"[^A-Za-z0-9_.-]", "_", self.hostname) or "unknown-host"
-        self.log_dir = Path(g["log_dir"]).expanduser()
+        self.hostname, self.log_dir = resolve_host_and_log_dir(cfg)
         self.writer = LogWriter(self.log_dir, self.hostname)
         self.stop_event = threading.Event()
         self.reload_event = threading.Event()   # set by SIGHUP, serviced by the ticker
@@ -919,6 +1130,8 @@ class Daemon:
 
         self.window_source = select_window_source()
         self.power_source = select_power_source(cfg["power"])
+        self.idle_source = (select_idle_source(cfg["idle"])
+                            if cfg["idle"].get("enabled", True) else None)
         self.uploader = Uploader(cfg["upload"], self.log_dir, self.hostname,
                                  retention=cfg["retention"])
 
@@ -1022,9 +1235,14 @@ class Daemon:
             self.power_source.log_suspend_resume = pw.get("log_suspend_resume", True)
             self.power_source.log_shutdown = pw.get("log_shutdown", True)
             self.power_source.log_lock_unlock = pw.get("log_lock_unlock", False)
+        if self.idle_source is not None:
+            i = new_cfg["idle"]
+            self.idle_source.timeout = float(i["timeout"])
+            self.idle_source.mode = str(i["mode"])
         detail = (f"heartbeat={int(self.heartbeat_interval)}s "
                   f"upload_interval={new_cfg['upload'].get('interval')}s "
-                  f"proc_interval={new_cfg['processes'].get('interval')}s")
+                  f"proc_interval={new_cfg['processes'].get('interval')}s "
+                  f"idle_timeout={new_cfg['idle'].get('timeout')}s")
         self.writer.write("STATUS", ["config-reload", detail])
         logmsg(f"config reloaded (SIGHUP): {detail}")
 
@@ -1038,6 +1256,12 @@ class Daemon:
             self.writer.write("STATUS", ["window-source-recovered", detail])
         else:
             self.writer.write("STATUS", ["window-source-unavailable", detail])
+
+    def _on_idle_backend_status(self, up: bool, detail: str):
+        if up:
+            self.writer.write("STATUS", ["idle-source-recovered", detail])
+        else:
+            self.writer.write("STATUS", ["idle-source-unavailable", detail])
 
     def _startup_power(self):
         # Classify how the PREVIOUS session ended, BEFORE writing anything this run.
@@ -1141,6 +1365,10 @@ class Daemon:
         if isinstance(self.window_source, NiriWindowSource):
             self.window_source.on_backend_status = self._on_window_backend_status
         self.power_source.on_event = self._on_power_event
+        if self.idle_source is not None:
+            # idle/active are presence events -> same POWER writer as power events
+            self.idle_source.on_event = self._on_power_event
+            self.idle_source.on_backend_status = self._on_idle_backend_status
 
         # seed current focus so the first heartbeat has data promptly
         try:
@@ -1151,6 +1379,8 @@ class Daemon:
         self._spawn(self.window_source.start, "window-source")
         if self.cfg["power"].get("enabled", True):
             self._spawn(self.power_source.start, "power-source")
+        if self.idle_source is not None:
+            self._spawn(self.idle_source.start, "idle-source")
         self._spawn(self._ticker, "ticker", pass_stop=False)
         if self.cfg["processes"].get("enabled", True):
             self._spawn(self._process_loop, "processes", pass_stop=False)
@@ -1206,6 +1436,15 @@ def select_power_source(power_cfg: dict) -> PowerSource:
             log_lock_unlock=power_cfg.get("log_lock_unlock", False))
     # elif system == "Darwin": return MacPowerSource()  # future (IOKit/pmset)
     return LogindPowerSource()  # best effort
+
+
+def select_idle_source(idle_cfg: dict) -> IdleSource | None:
+    system = _platform.system()
+    if system == "Linux":
+        return WaylandIdleSource(timeout=idle_cfg.get("timeout", 300),
+                                 mode=idle_cfg.get("mode", "inhibitor-aware"))
+    # elif system == "Darwin": return MacIdleSource()  # future (IOHIDIdleTime)
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -1380,6 +1619,54 @@ def cmd_status(cfg, source, args):
     return 2 if problems else (1 if warns else 0)
 
 
+def cmd_tail(cfg, source, args):
+    """tail -f for the local audit log: print the last lines of the newest log
+    file, then follow it, hopping to the next file across the daily rotation."""
+    hostname, log_dir = resolve_host_and_log_dir(cfg)
+
+    def newest():
+        files = sorted(p for p in log_dir.glob(f"{hostname}-*.log") if p.is_file())
+        return files[-1] if files else None
+
+    cur = newest()
+    fh = None
+    buf = ""
+    try:
+        if cur is None:
+            print(f"(no logs yet for {hostname} in {log_dir}; waiting)",
+                  file=sys.stderr)
+        else:
+            fh = cur.open("r", encoding="utf-8", errors="replace")
+            for line in fh.read().splitlines()[-max(0, args.lines):]:
+                print(line, flush=True)
+        while True:
+            if fh is not None:
+                buf += fh.read()
+                *complete, buf = buf.split("\n")
+                for line in complete:
+                    print(line, flush=True)
+            nf = newest()
+            if nf is not None and nf != cur:   # daily rotation / first file
+                if fh is not None:
+                    buf += fh.read()           # drain any final writes
+                    fh.close()
+                    if buf:
+                        print(buf, flush=True)
+                        buf = ""
+                cur = nf
+                fh = cur.open("r", encoding="utf-8", errors="replace")
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        return 0
+    except BrokenPipeError:
+        # keep the interpreter's exit-time stdout flush from raising EPIPE noise
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return 0
+    finally:
+        if fh is not None:
+            fh.close()
+
+
 def cmd_version(cfg, source, args):
     print(get_version())
     return 0
@@ -1390,6 +1677,7 @@ COMMANDS = {
     "snapshot": cmd_snapshot,
     "upload": cmd_upload,
     "status": cmd_status,
+    "tail": cmd_tail,
     "version": cmd_version,
 }
 
@@ -1403,6 +1691,8 @@ def main(argv=None):
                         help="(snapshot) also append the line to the audit log")
     parser.add_argument("--json", action="store_true",
                         help="(status) emit machine-readable JSON")
+    parser.add_argument("-n", "--lines", type=int, default=20,
+                        help="(tail) trailing lines to print before following")
     parser.add_argument("-V", "--version", action="store_true",
                         help="print the tool version and exit")
     args = parser.parse_args(argv)

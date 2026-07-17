@@ -50,6 +50,15 @@ R12. **Automatic versioning + version logging.** The tool version is derived, ne
     bundle/install time, else `unknown`. Logged as a `STATUS version ...` line at each
     startup (auditor sees which version produced a session's logs) and exposed via
     `window-logger version` / `--version` and in `status`.
+R13. **User idle/presence qualification.** Log when the session goes input-idle and
+    when it becomes active again, so an auditor can tell "screen on, nobody at the
+    controls" apart from active use. `POWER idle` (detail `since=<iso>`, back-dated to
+    when input actually stopped) and `POWER active` (detail `idle_for=<N>s`). Source:
+    Wayland `ext-idle-notify-v1`, spoken directly over the compositor socket (pure
+    stdlib, no new dependencies). Configurable `[idle] timeout` (default 300s) and
+    `mode` (`inhibitor-aware` default: a held idle inhibitor, e.g. video playback,
+    counts as present; `input-only` uses protocol v2 raw input silence). Behind an
+    `IdleSource` abstraction (R9; macOS later via IOHIDIdleTime).
 
 ## Target environment (initial client: `dgframework`)
 
@@ -107,6 +116,12 @@ Concretely, per an explicit 2026-07-17 decision by the user:
     `org.freedesktop.login1` (no root needed) for `PrepareForSleep` / `PrepareForShutdown`
     / session `Lock`/`Unlock`. Plus startup `online`/`boot` + unclean-shutdown detection
     + SIGTERM → clean `offline`. → `POWER` / `STATUS` lines (R6).
+  - **IdleSource** (`WaylandIdleSource`): user idle/active via `ext-idle-notify-v1`,
+    spoken directly over the Wayland socket (pure stdlib wire client — niri advertises
+    the protocol at v2; verified live). Emits `POWER idle`/`POWER active` (R13);
+    availability problems emit `STATUS idle-source-unavailable/recovered`.
+    `WAYLAND_DISPLAY` is recovered from the niri socket name when systemd didn't
+    import the session env.
   - **ProcSampler**: top-N processes by CPU from `/proc`, top-style delta over a short
     window, on its own interval (R10). → `PROCS` lines.
   - **Uploader**: rsync over SSH (R5), network-resilient with backoff (R7), confirms via
@@ -114,7 +129,8 @@ Concretely, per an explicit 2026-07-17 decision by the user:
   - Backends selected by `platform` for future macOS support (R9).
   - `apply_env_overrides` makes every option settable via `WINDOW_LOGGER_<SECTION>_<KEY>`.
 - CLI subcommands: `run` (daemon), `snapshot` (one-shot test line), `upload` (force sync),
-  `status` (health check), `version`.
+  `status` (health check), `tail` (tail -f the local audit log, follows across daily
+  rotation; `-n` trailing lines), `version`.
 - **SIGHUP reloads config live** (serviced by the ticker, not the handler) and writes a
   `STATUS config-reload` line; `systemctl --user reload window-logger` triggers it via
   `ExecReload`. Tunables (intervals, debounce, fields, top_n, upload/retention settings)
@@ -125,13 +141,18 @@ Concretely, per an explicit 2026-07-17 decision by the user:
 
 Log line schema: `ISO8601±tz <TAB> {WINDOW|POWER|STATUS|PROCS} <TAB> …`.
 - WINDOW: configured fields in order (title last).
-- POWER:  `event <TAB> detail`  (online/offline/suspend/resume/shutdown/lock/unlock).
-          The `online` detail always carries `boot=<iso> prior=<none|clean|unclean>` so
-          each startup self-describes how the previous session ended.
+- POWER:  `event <TAB> detail`  (online/offline/suspend/resume/shutdown/lock/unlock/
+          idle/active). The `online` detail always carries
+          `boot=<iso> prior=<none|clean|unclean>` so each startup self-describes how
+          the previous session ended. `idle` carries `since=<iso>` (when input
+          actually stopped — the line itself is stamped one timeout later, at
+          detection); `active` carries `idle_for=<N>s`. An idle bracket interrupted
+          by `STATUS idle-source-unavailable` is unterminated (state unknown).
 - STATUS: `event <TAB> detail`. `previous-session-unclean` fires only when prior=unclean
           and is qualified with `last=<ts> last_event=<TYPE[:subtype]>`. Also `version`
           (each startup), `config-reload` / `config-reload-failed` (SIGHUP),
-          window-source-unavailable/recovered, power-source-unavailable.
+          window-source-unavailable/recovered, power-source-unavailable,
+          idle-source-unavailable/recovered.
 - PROCS:  space-joined `comm:pid:cpu%` tokens (optionally `:cmdline`).
 
 ## Requirement changes
@@ -168,6 +189,12 @@ Append dated entries here whenever scope shifts (newest last):
   upload verified end-to-end on 2026-07-17.
 - 2026-07-17 — `status` upgraded to a health check (service state, last-log staleness, last
   transmission) with HEALTHY/WARN/UNHEALTHY verdict + matching exit code (0/1/2) and `--json`.
+- 2026-07-17 — Added R13 (idle/presence qualification). Investigated logind IdleHint
+  (dead — niri never sets it), DMS IPC (no idle handler), swayidle (extra dependency);
+  chose speaking `ext-idle-notify-v1` directly over the Wayland socket in pure stdlib.
+  Kept only `since=` on the idle line (`timeout=` was redundant — user decision).
+- 2026-07-17 — Added `tail` subcommand (tail -f of the local audit log, follows daily
+  rotation) — user request; was previously done by hand.
 - 2026-07-17 — Multi-device deploy plan: chezmoi. `deploy/chezmoi/` manages config + unit as
   dotfiles and fetches the single-file daemon from GitHub via a chezmoi external (auto-update);
   a run_ hook does per-device keygen + restart-on-change. (User will roll this out later.)

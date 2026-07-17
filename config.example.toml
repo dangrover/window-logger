@@ -42,6 +42,20 @@ log_lock_unlock = false
 # marker, emit a STATUS "previous-session-unclean" line.
 detect_unclean_shutdown = true
 
+[idle]
+# Record user presence via the Wayland ext-idle-notify protocol: a POWER "idle" line
+# once no input has arrived for `timeout` seconds (detail carries since=<when input
+# actually stopped>), and a POWER "active" line on the next input (idle_for=<seconds>).
+# Lets an auditor tell "screen on, nobody at the controls" apart from active use.
+enabled = true
+# Seconds without input before the session counts as idle.
+timeout = 300
+# "inhibitor-aware": apps holding an idle inhibitor (e.g. video playback) keep the
+#                    session counted as active even without input.
+# "input-only":      raw input silence only (needs ext-idle-notify v2 in the
+#                    compositor; falls back to inhibitor-aware if unavailable).
+mode = "inhibitor-aware"
+
 [processes]
 # Periodically log the top-N processes by CPU (useful context alongside window focus).
 enabled = true
