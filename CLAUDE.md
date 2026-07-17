@@ -145,8 +145,8 @@ Log line schema: `ISO8601±tz <TAB> {WINDOW|POWER|STATUS|PROCS} <TAB> …`.
           default; enabled by adding "mux" to `[capture] fields`): when the focused
           window is a terminal (app_id heuristic, `MuxProbe.TERMINALS`) whose title
           names a known terminal multiplexer as a standalone word, carries its focused tab
-          (`herdr:<tab-label>` via `herdr tab list`, `tmux:<session>:<window>` via
-          `tmux display-message`). Best-effort; empty when not applicable. Intra-mux
+          (`herdr:<space>:<tab>` via `herdr workspace list` + `herdr tab list`,
+          `tmux:<session>:<window>` via `tmux display-message`). Best-effort; empty when not applicable. Intra-mux
           tab switches produce no compositor event, so they surface at the next
           heartbeat.
 - POWER:  `event <TAB> detail`  (online/offline/suspend/resume/shutdown/lock/unlock/

@@ -606,14 +606,26 @@ class MuxProbe:
         label = ""
         try:
             if prog == "herdr":
-                # socket API: exactly one tab carries focused=true
+                # socket API: exactly one tab carries focused=true. Workspaces
+                # ("spaces") are the level above tabs; label as space:tab.
                 out = subprocess.run(["herdr", "tab", "list"],
                                      capture_output=True, text=True, timeout=1.5)
                 if out.returncode == 0:
                     tabs = json.loads(out.stdout)["result"]["tabs"]
                     foc = [t for t in tabs if t.get("focused")]
                     if foc:
-                        label = f"herdr:{foc[0].get('label') or '?'}"
+                        tab = foc[0].get("label") or "?"
+                        space = ""
+                        wout = subprocess.run(["herdr", "workspace", "list"],
+                                              capture_output=True, text=True,
+                                              timeout=1.5)
+                        if wout.returncode == 0:
+                            spaces = json.loads(wout.stdout)["result"]["workspaces"]
+                            for w in spaces:
+                                if w.get("workspace_id") == foc[0].get("workspace_id"):
+                                    space = w.get("label") or ""
+                                    break
+                        label = f"herdr:{space}:{tab}" if space else f"herdr:{tab}"
             elif prog == "tmux":
                 # most recently active client's session:window
                 out = subprocess.run(["tmux", "display-message", "-p", "#S:#W"],
