@@ -152,7 +152,9 @@ Log line schema: `ISO8601±tz <TAB> {WINDOW|POWER|STATUS|PROCS} <TAB> …`.
 - POWER:  `event <TAB> detail`  (online/offline/suspend/resume/shutdown/lock/unlock/
           idle/active). The `online` detail always carries
           `boot=<iso> prior=<none|clean|unclean>` so each startup self-describes how
-          the previous session ended. `idle` carries `since=<iso>` (when input
+          the previous session ended; it appends `gap=daemon-restart` when the pair
+          is provably just a logger restart (prior clean `offline`, boot time predates
+          the last line — machine never went down — and the gap is ≤300s). `idle` carries `since=<iso>` (when input
           actually stopped — the line itself is stamped one timeout later, at
           detection); `active` carries `idle_for=<N>s`. An idle bracket interrupted
           by `STATUS idle-source-unavailable` is unterminated (state unknown).

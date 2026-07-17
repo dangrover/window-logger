@@ -1372,6 +1372,15 @@ class Daemon:
         detail = f"boot={boot}" if boot else "boot=?"
         if prior is not None:
             detail += f" prior={prior}"
+        # Disambiguate for the auditor: if the previous session ended with a clean
+        # daemon `offline`, the machine was already booted before that line was
+        # written (no reboot in between), and the logger was only briefly down,
+        # this offline/online pair is a daemon restart -- not a power event.
+        if prior == "clean" and last_event == "POWER:offline" and boot:
+            lt, bt = _parse_iso(last_ts or ""), _parse_iso(boot)
+            gap_ok = lt and (dt.datetime.now().astimezone() - lt).total_seconds() <= 300
+            if lt and bt and bt < lt and gap_ok:
+                detail += " gap=daemon-restart"
         self.writer.write("POWER", ["online", detail])
 
         if prior == "unclean":
