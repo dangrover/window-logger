@@ -763,16 +763,22 @@ class Uploader:
 
     def _confirm_synced(self) -> set[str]:
         """Files whose remote copy matches local. If verify is off, trust the transfer
-        (all local files). If on, run a dry-run itemize; files NOT listed are in sync."""
+        (all local files). If on, run a dry-run itemize; files NOT listed are in sync.
+        If the verify dry-run itself can't run, fall back to trusting the primary upload
+        (which already succeeded) rather than leaving files stuck un-prunable forever."""
         local = set(self._closed_local_files())
         if not self.cfg.get("verify"):
             return local
         try:
             res = self._run_rsync(["-n", "-i", "--out-format=%n"])
-        except (subprocess.SubprocessError, OSError):
-            return set()  # can't confirm -> confirm nothing (conservative)
+        except (subprocess.SubprocessError, OSError) as e:
+            logmsg(f"verify dry-run failed ({e}); trusting the successful upload")
+            return local
         if res.returncode != 0:
-            return set()
+            err = (res.stderr or "").strip().splitlines()
+            logmsg(f"verify dry-run exit {res.returncode} "
+                   f"({err[-1] if err else '?'}); trusting the successful upload")
+            return local
         differing = set()
         for ln in (res.stdout or "").splitlines():
             ln = ln.strip().rstrip("/")
@@ -895,6 +901,7 @@ class Daemon:
         self.log_dir = Path(g["log_dir"]).expanduser()
         self.writer = LogWriter(self.log_dir, self.hostname)
         self.stop_event = threading.Event()
+        self.reload_event = threading.Event()   # set by SIGHUP, serviced by the ticker
 
         # capture state
         c = cfg["capture"]
@@ -972,11 +979,54 @@ class Daemon:
             self._write_window(snap, now)
 
     def _ticker(self):
-        """Drives title-debounce flushes and heartbeats even without new events."""
+        """Drives title-debounce flushes and heartbeats even without new events;
+        also services SIGHUP config reloads (kept out of the signal handler)."""
         while not self.stop_event.wait(1.0):
+            if self.reload_event.is_set():
+                self.reload_event.clear()
+                self._reload_config()
             now = time.monotonic()
             with self._state_lock:
                 self._evaluate(now, from_event=False)
+
+    def _reload_config(self):
+        """Re-read the config file and apply tunable settings live (SIGHUP). Writes a
+        STATUS line so the reload is visible in the audit log. Structural settings
+        (log_dir, hostname, enabling/disabling subsystems) still need a full restart."""
+        try:
+            new_cfg, _ = load_config(self.config_source)
+        except Exception as e:  # noqa: BLE001 - never let a bad config kill the daemon
+            logmsg(f"config reload failed: {e}")
+            self.writer.write("STATUS", ["config-reload-failed", str(e)[:150]])
+            return
+        # Swap in the new config and re-point the objects that hold section refs.
+        # Reference swaps are atomic under the GIL, so concurrent readers see a
+        # consistent old-or-new dict (never a half-updated one).
+        self.cfg = new_cfg
+        self.uploader.cfg = new_cfg["upload"]
+        self.uploader.retention = new_cfg["retention"]
+        c = new_cfg["capture"]
+        self.heartbeat_interval = float(c["heartbeat_interval"])
+        self.title_debounce = float(c["title_debounce"])
+        self.max_title = int(c["max_title_length"])
+        self.fields = list(c["fields"])
+        self.log_no_focus = bool(c["log_no_focus"])
+        p = new_cfg["processes"]
+        self.proc_sampler.top_n = int(p["top_n"])
+        self.proc_sampler.sample_window = float(p["sample_window"])
+        self.proc_sampler.normalize = bool(p["normalize"])
+        self.proc_sampler.include_cmdline = bool(p["include_cmdline"])
+        self.proc_sampler.cmdline_max = int(p["cmdline_max_length"])
+        if isinstance(self.power_source, LogindPowerSource):
+            pw = new_cfg["power"]
+            self.power_source.log_suspend_resume = pw.get("log_suspend_resume", True)
+            self.power_source.log_shutdown = pw.get("log_shutdown", True)
+            self.power_source.log_lock_unlock = pw.get("log_lock_unlock", False)
+        detail = (f"heartbeat={int(self.heartbeat_interval)}s "
+                  f"upload_interval={new_cfg['upload'].get('interval')}s "
+                  f"proc_interval={new_cfg['processes'].get('interval')}s")
+        self.writer.write("STATUS", ["config-reload", detail])
+        logmsg(f"config reloaded (SIGHUP): {detail}")
 
     # ---- POWER writing (R6) ----
     def _on_power_event(self, event: str, detail: str):
@@ -1030,7 +1080,6 @@ class Daemon:
     def _process_loop(self):
         if not self.cfg["processes"].get("enabled", True):
             return
-        interval = float(self.cfg["processes"]["interval"])
         # first sample soon after startup, then every `interval`
         while not self.stop_event.is_set():
             try:
@@ -1039,6 +1088,8 @@ class Daemon:
                     self.writer.write("PROCS", [" ".join(tokens)])
             except Exception as e:  # noqa: BLE001 - keep daemon alive
                 logmsg(f"process sample failed: {e}")
+            # read interval fresh each cycle so SIGHUP reloads take effect live
+            interval = float(self.cfg["processes"]["interval"])
             # sample_window already consumed some time inside sample()
             if self.stop_event.wait(max(0.0, interval - self.proc_sampler.sample_window)):
                 break
@@ -1065,11 +1116,14 @@ class Daemon:
 
     # ---- lifecycle ----
     def _install_signals(self):
-        def handler(signum, _frame):
+        def stop_handler(signum, _frame):
             logmsg(f"received signal {signum}; shutting down")
             self.stop_event.set()
         for s in (signal.SIGTERM, signal.SIGINT):
-            signal.signal(s, handler)
+            signal.signal(s, stop_handler)
+        # SIGHUP -> reload config (serviced by the ticker, not in the handler itself).
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, lambda *_: self.reload_event.set())
 
     def run(self):
         self._install_signals()

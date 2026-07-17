@@ -114,7 +114,12 @@ Concretely, per an explicit 2026-07-17 decision by the user:
   - Backends selected by `platform` for future macOS support (R9).
   - `apply_env_overrides` makes every option settable via `WINDOW_LOGGER_<SECTION>_<KEY>`.
 - CLI subcommands: `run` (daemon), `snapshot` (one-shot test line), `upload` (force sync),
-  `status` (config + per-file transmission state).
+  `status` (health check), `version`.
+- **SIGHUP reloads config live** (serviced by the ticker, not the handler) and writes a
+  `STATUS config-reload` line; `systemctl --user reload window-logger` triggers it via
+  `ExecReload`. Tunables (intervals, debounce, fields, top_n, upload/retention settings)
+  apply live; structural changes (log_dir, hostname, enabling/disabling subsystems) still
+  need a restart. Loops read intervals fresh each cycle so reloads take effect.
 - `config.example.toml`, `install.sh` (repo installer + systemd unit), `build-deploy.sh`
   (bundles everything into one self-contained deploy script for R3).
 
@@ -124,7 +129,8 @@ Log line schema: `ISO8601±tz <TAB> {WINDOW|POWER|STATUS|PROCS} <TAB> …`.
           The `online` detail always carries `boot=<iso> prior=<none|clean|unclean>` so
           each startup self-describes how the previous session ended.
 - STATUS: `event <TAB> detail`. `previous-session-unclean` fires only when prior=unclean
-          and is qualified with `last=<ts> last_event=<TYPE[:subtype]>`. Also
+          and is qualified with `last=<ts> last_event=<TYPE[:subtype]>`. Also `version`
+          (each startup), `config-reload` / `config-reload-failed` (SIGHUP),
           window-source-unavailable/recovered, power-source-unavailable.
 - PROCS:  space-joined `comm:pid:cpu%` tokens (optionally `:cmdline`).
 
@@ -151,6 +157,10 @@ Append dated entries here whenever scope shifts (newest last):
   No redaction/filtering knobs — see "Design philosophy". Do not reintroduce.
 - 2026-07-17 — Added R12 (automatic git-hash-based versioning + `STATUS version` startup
   line; `version`/`--version` commands). No manual version bumps.
+- 2026-07-17 — Review fixes: SIGHUP config reload (logs `STATUS config-reload`; `ExecReload`
+  in the unit; loops read intervals live); verify dry-run failure now falls back to trusting
+  the successful primary upload (so files aren't left un-prunable). Server-side security
+  findings (world-readable logs, full-shell key) noted but intentionally deferred by user.
 - 2026-07-17 — Added R11 (client-side retention: prune local logs older than retain_days,
   server copies untouched, `require_sent` safety guard).
 - 2026-07-17 — Server (first client `dgframework`): dangrover@server.alder.dangrover.com,

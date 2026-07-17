@@ -8,6 +8,7 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 ExecStart=@BIN@ run --config @CONFIG@
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 # Allow time to write the clean "offline" marker when the session/machine stops.
