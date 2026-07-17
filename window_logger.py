@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""window-logger — log the focused window and power/presence events to per-host text
+"""window-logger - log the focused window and power/presence events to per-host text
 logs, and sync them to a server with rsync.
 
-Single-file daemon. Requirements are tracked in CLAUDE.md (R1–R9).
+Single-file daemon. Requirements are tracked in CLAUDE.md (R1-R9).
 
 Backends are platform-abstracted (WindowSource / PowerSource) so other platforms
 (e.g. macOS) can be added later; only the Linux (niri + logind) backends ship today.
@@ -212,7 +212,7 @@ def sanitize_field(val) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Log writer (thread-safe, daily rotation) — R4
+# Log writer (thread-safe, daily rotation) - R4
 # --------------------------------------------------------------------------- #
 
 class LogWriter:
@@ -509,7 +509,7 @@ class LogindPowerSource(PowerSource):
 
 
 # --------------------------------------------------------------------------- #
-# Process sampler — top-N by CPU (R10)
+# Process sampler - top-N by CPU (R10)
 # --------------------------------------------------------------------------- #
 
 class ProcSampler:
@@ -597,7 +597,7 @@ class ProcSampler:
 
 
 # --------------------------------------------------------------------------- #
-# Uploader — network-resilient rsync + transmission tracking (R5, R7, R8)
+# Uploader - network-resilient rsync + transmission tracking (R5, R7, R8)
 # --------------------------------------------------------------------------- #
 
 class Uploader:
@@ -787,7 +787,7 @@ class Uploader:
     def apply_retention(self) -> int:
         """Delete LOCAL log files older than retain_days. Because rsync never runs with
         --delete, this never affects the server. With require_sent (default), only files
-        confirmed present on the server are eligible — so nothing is ever lost (R11).
+        confirmed present on the server are eligible - so nothing is ever lost (R11).
         Returns the number of files pruned."""
         ret = self.retention
         if not ret.get("enabled", False):
@@ -879,7 +879,7 @@ class Daemon:
     def _format_window(self, snap: WindowSnapshot) -> list:
         title = snap.title
         if len(title) > self.max_title:
-            title = title[: self.max_title] + "…"
+            title = title[: self.max_title] + "..."
         vals = {"app_id": snap.app_id or "(none)", "pid": snap.pid,
                 "title": title, "wid": snap.wid}
         return [vals.get(f, "") for f in self.fields]
@@ -1185,7 +1185,7 @@ def cmd_status(cfg, source, args):
     svc = _systemctl_state("window-logger.service")
     installed = svc is not None and "not-found" not in svc["enabled"] and svc["enabled"] != "unknown"
     if svc is None:
-        notes.append("systemctl unavailable — cannot check service")
+        notes.append("systemctl unavailable - cannot check service")
     elif not installed:
         notes.append("service not installed as a systemd unit (running manually?)")
     elif svc["active"] != "active":
@@ -1233,7 +1233,7 @@ def cmd_status(cfg, source, args):
         if (d.log_dir / "sent").is_dir() else []
 
     verdict = "UNHEALTHY" if problems else ("WARN" if warns else "HEALTHY")
-    mark = {"HEALTHY": "✓", "WARN": "!", "UNHEALTHY": "✗"}[verdict]
+    mark = {"HEALTHY": "+", "WARN": "!", "UNHEALTHY": "x"}[verdict]
 
     if getattr(args, "json", False):
         out = {
@@ -1265,11 +1265,11 @@ def cmd_status(cfg, source, args):
             print("  upload:        disabled")
         print(f"  files:         {len(logs)} pending, {len(sent)} sent   log_dir={d.log_dir}")
         for msg in problems:
-            print(f"  ✗ {msg}")
+            print(f"  x {msg}")
         for msg in warns:
             print(f"  ! {msg}")
         for msg in notes:
-            print(f"  · {msg}")
+            print(f"  - {msg}")
 
     return 2 if problems else (1 if warns else 0)
 
