@@ -17,7 +17,8 @@ R3. **Easy single-script deployment.** One script deploys to each Linux client a
     it as a **systemd user service** (per-user — focus is a per-session concept).
 R4. **Log format.** Files named per host + per day; each line is
     `timestamp<TAB>TYPE<TAB>fields…`. Hostname is in the filename. Chosen window fields:
-    `app_id`, `pid`, `title` (title last; sanitized/redactable).
+    `app_id`, `pid`, `title` (title last; sanitized only for TAB/newline safety —
+    titles are recorded verbatim, see Design philosophy).
 R5. **Upload via rsync.** Logs sync to an established server/path via `rsync` over SSH key
     auth using saved credentials.
 R6. **Power / presence events.** Record power & session events — boot/online, suspend,
@@ -54,14 +55,33 @@ R11. **Client-side log retention.** Prune local log files older than a configura
 - Tooling present on client: `niri`, `jq`, `rsync`, `python3` (3.14), user `systemd`.
 - Distro: CachyOS (Arch-based).
 
-### Design notes
+### Design philosophy — consensual, faithful monitoring (READ BEFORE ADDING "PRIVACY" KNOBS)
+
+This tool is deployed **only between consenting parties who have agreed to be monitored**
+(e.g. the operator's own fleet, or people who have explicitly opted in). Given that, the
+guiding principle is **faithful, complete capture** — the log should be an honest record of
+what was on screen, not a curated one.
+
+Concretely, per an explicit 2026-07-17 decision by the user:
+
+- **Do NOT add redaction, title-filtering, app-ignore, or similar "privacy" features.**
+  `ignore_app_ids` and `redact_title_patterns` existed briefly and were deliberately
+  **removed**. Do not reintroduce them or anything of that nature (title scrubbing,
+  per-app blocklists, "sensitive window" suppression, etc.).
+- Window **titles are recorded verbatim.** The only title processing is mechanical: strip
+  TAB/newline so a line stays one TSV row, and truncate absurdly long titles
+  (`max_title_length`) purely for log hygiene — not for content control.
+- The right place for any "should this person be monitored at all" decision is **consent
+  and deployment scope**, not runtime filtering in this tool.
+- If a future request sounds like redaction/obfuscation, surface this note and confirm
+  intent before implementing — it contradicts the established design intent.
+
+### Other design notes
 
 - niri exposes an **event stream**, so focus changes can be captured event-driven rather
   than only by polling — but the user asked for interval-based snapshots, so interval
   polling is the baseline behavior. Keep the window-source behind a small abstraction so
   other compositors (Hyprland `hyprctl`, sway `swaymsg`, X11) can be added later.
-- Window titles can contain sensitive data (URLs, document names). Treat privacy/redaction
-  as a real config concern.
 
 ## Repo conventions
 
@@ -120,6 +140,9 @@ Append dated entries here whenever scope shifts (newest last):
   so it never pollutes the audit log / trips the detector.
 - 2026-07-17 — Decisions from live testing: keep full window titles (no redaction); PROCS
   CPU normalized to 0-100% of machine by default (`[processes] normalize`).
+- 2026-07-17 — **Removed `ignore_app_ids` and `redact_title_patterns` entirely.** Tool is for
+  consensual monitoring between agreeing parties; faithful verbatim capture is the intent.
+  No redaction/filtering knobs — see "Design philosophy". Do not reintroduce.
 - 2026-07-17 — Added R11 (client-side retention: prune local logs older than retain_days,
   server copies untouched, `require_sent` safety guard).
 - 2026-07-17 — Server (first client `dgframework`): dangrover@server.alder.dangrover.com,

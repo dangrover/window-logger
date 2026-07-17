@@ -27,10 +27,6 @@ max_title_length = 500
 # Columns to emit per WINDOW line, in order. Available: app_id, pid, title, wid.
 # (timestamp + record type are always prepended; keep title last.)
 fields = ["app_id", "pid", "title"]
-# Never log when one of these app_ids is focused (e.g. a password manager).
-ignore_app_ids = []
-# Regexes; any matching span in a title is replaced with [REDACTED].
-redact_title_patterns = []
 # Emit a line when nothing is focused (empty workspace, overview, etc.).
 log_no_focus = true
 
@@ -40,7 +36,7 @@ log_no_focus = true
 enabled = true
 log_suspend_resume = true
 log_shutdown = true
-# Session lock/unlock. Off by default (noisier, more privacy-sensitive).
+# Session lock/unlock. Off by default (noisier).
 log_lock_unlock = false
 # On startup, if the previous session didn't end with a clean offline/suspend/shutdown
 # marker, emit a STATUS "previous-session-unclean" line.
@@ -58,8 +54,7 @@ sample_window = 0.5
 # true  = 0-100% of the whole machine (divided by core count).
 # false = top/Irix style: summed across cores, so a busy process can read >100%.
 normalize = true
-# Append a truncated command line to each entry. Off by default: cmdlines can leak
-# secrets (tokens, passwords passed as args).
+# Append a truncated command line to each entry. Off by default (extra volume/noise).
 include_cmdline = false
 cmdline_max_length = 80
 

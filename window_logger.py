@@ -52,8 +52,6 @@ DEFAULTS = {
         "title_debounce": 4.0,         # seconds; collapse title-only churn (spinners)
         "max_title_length": 500,
         "fields": ["app_id", "pid", "title"],   # order of WINDOW columns (R4)
-        "ignore_app_ids": [],          # never log these app_ids
-        "redact_title_patterns": [],   # regexes; matched spans -> [REDACTED]
         "log_no_focus": True,          # emit a line when nothing is focused
     },
     "power": {
@@ -69,7 +67,7 @@ DEFAULTS = {
         "top_n": 15,
         "sample_window": 0.5,          # seconds; CPU measured over this window (top-style)
         "normalize": True,             # True: 0-100% of whole machine; False: top/Irix (per-core sum)
-        "include_cmdline": False,      # append a truncated cmdline (may contain secrets)
+        "include_cmdline": False,      # append a truncated cmdline (extra volume/noise)
         "cmdline_max_length": 80,
     },
     "retention": {
@@ -857,8 +855,6 @@ class Daemon:
         self.title_debounce = float(c["title_debounce"])
         self.max_title = int(c["max_title_length"])
         self.fields = list(c["fields"])
-        self.ignore_app_ids = set(c["ignore_app_ids"])
-        self.redact = [re.compile(p) for p in c["redact_title_patterns"]]
         self.log_no_focus = bool(c["log_no_focus"])
 
         self._state_lock = threading.Lock()
@@ -882,8 +878,6 @@ class Daemon:
     # ---- WINDOW writing (R1) ----
     def _format_window(self, snap: WindowSnapshot) -> list:
         title = snap.title
-        for rx in self.redact:
-            title = rx.sub("[REDACTED]", title)
         if len(title) > self.max_title:
             title = title[: self.max_title] + "…"
         vals = {"app_id": snap.app_id or "(none)", "pid": snap.pid,
@@ -905,13 +899,9 @@ class Daemon:
     def _evaluate(self, now: float, from_event: bool):
         """Decide whether to write a WINDOW line. Caller holds _state_lock."""
         snap = self._current
-        if snap.is_none():
-            if not self.log_no_focus:
-                return
-        elif snap.app_id in self.ignore_app_ids:
+        if snap.is_none() and not self.log_no_focus:
             return
 
-        cur_key = (snap.identity(), snap.title)
         if self._last_logged is None:
             self._write_window(snap, now)
             return
