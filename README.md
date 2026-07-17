@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="window-logger logo" width="300">
+</p>
+
 # window-logger
 
 A small, dependency-light daemon that records the **focused window**, **power/presence
