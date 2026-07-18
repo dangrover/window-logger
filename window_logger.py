@@ -116,6 +116,10 @@ DEFAULTS = {
         "timeout": 300,                # seconds without input before "idle"
         "mode": "inhibitor-aware",     # or "input-only" (ignore idle inhibitors)
     },
+    "media": {
+        "enabled": True,               # log now-playing media via MPRIS (R14)
+        "interval": 5,                 # seconds between MPRIS polls
+    },
     "processes": {
         "enabled": True,               # log top-N processes by CPU (R10)
         "interval": 60,                # seconds between PROCS samples
@@ -561,6 +565,113 @@ class LogindPowerSource(PowerSource):
                 self.on_event("lock", "")
             elif self.UNLOCK_RE.search(line):
                 self.on_event("unlock", "")
+
+
+# --------------------------------------------------------------------------- #
+# Media playback source (MPRIS) - R14
+# --------------------------------------------------------------------------- #
+
+class MediaSource:
+    """Abstract now-playing source. Calls self.on_event(fields) with the MEDIA
+    columns [player, status, artist, album, title, url]."""
+
+    def __init__(self):
+        self.on_event = lambda fields: None
+        self.on_backend_status = lambda up, detail: None
+
+    def start(self, stop_event: threading.Event):
+        raise NotImplementedError
+
+
+class MprisMediaSource(MediaSource):
+    """Now-playing media via MPRIS2 on the session D-Bus -- the same machinery
+    the DMS media widget reads. Every conforming player owns a bus name under
+    org.mpris.MediaPlayer2.* (Spotify, VLC, mpv+plugin, and browsers: Chrome
+    registers chromium.instance_<N> and Firefox firefox.instance_<N> whenever
+    any HTML5 media plays, so YouTube/Netflix/podcasts are captured too).
+
+    Polls with `busctl --json` (present wherever user systemd is, which the
+    daemon already requires) and emits a MEDIA line only when a player's
+    (status, track) changes, so steady playback costs nothing in the log.
+    A player vanishing from the bus emits a final `Gone` line so listening
+    spans can be closed from the log alone."""
+
+    PREFIX = "org.mpris.MediaPlayer2."
+
+    def __init__(self, interval=5.0):
+        super().__init__()
+        self.interval = interval
+        self._last = {}     # player label -> (status, track key) last emitted
+        self._down = False
+
+    def start(self, stop_event: threading.Event):
+        if not shutil.which("busctl"):
+            logmsg("busctl not found; media events disabled")
+            self.on_backend_status(False, "media-source-unavailable=busctl-missing")
+            return
+        while not stop_event.is_set():
+            try:
+                self._poll()
+                if self._down:
+                    self._down = False
+                    self.on_backend_status(True, "")
+            except Exception as e:  # noqa: BLE001 - bus may be restarting; keep trying
+                if not self._down:
+                    self._down = True
+                    self.on_backend_status(False, str(e)[:150])
+            if stop_event.wait(float(self.interval)):
+                break
+
+    @staticmethod
+    def _busctl(args: list, timeout=5):
+        out = subprocess.run(["busctl", "--user", "--json=short", "call", *args],
+                             capture_output=True, text=True, timeout=timeout)
+        if out.returncode != 0:
+            raise OSError(out.stderr.strip() or "busctl call failed")
+        return json.loads(out.stdout)["data"]
+
+    def _list_players(self) -> list[str]:
+        names = self._busctl(["org.freedesktop.DBus", "/org/freedesktop/DBus",
+                              "org.freedesktop.DBus", "ListNames"])[0]
+        return [n for n in names if n.startswith(self.PREFIX)]
+
+    @staticmethod
+    def _v(props: dict, key: str, default=""):
+        ent = props.get(key)
+        return ent.get("data", default) if isinstance(ent, dict) else default
+
+    def _now_playing(self, name: str) -> tuple:
+        props = self._busctl([name, "/org/mpris/MediaPlayer2",
+                              "org.freedesktop.DBus.Properties", "GetAll",
+                              "s", "org.mpris.MediaPlayer2.Player"])[0]
+        status = self._v(props, "PlaybackStatus", "Unknown")
+        meta = self._v(props, "Metadata", {}) or {}
+        artist = self._v(meta, "xesam:artist")
+        if isinstance(artist, list):
+            artist = ", ".join(a for a in artist if a)
+        title = self._v(meta, "xesam:title")
+        album = self._v(meta, "xesam:album")
+        url = self._v(meta, "xesam:url")
+        trackid = self._v(meta, "mpris:trackid")
+        return status, artist, album, title, url, trackid
+
+    def _poll(self):
+        seen = set()
+        for name in self._list_players():
+            label = name[len(self.PREFIX):]
+            seen.add(label)
+            try:
+                status, artist, album, title, url, trackid = self._now_playing(name)
+            except (OSError, subprocess.SubprocessError,
+                    json.JSONDecodeError, LookupError):
+                continue    # player raced away mid-poll; next poll settles it
+            key = (status, trackid or (artist, title))
+            if self._last.get(label) != key:
+                self._last[label] = key
+                self.on_event([label, status, artist, album, title, url])
+        for label in [p for p in self._last if p not in seen]:
+            del self._last[label]
+            self.on_event([label, "Gone", "", "", "", ""])
 
 
 # --------------------------------------------------------------------------- #
@@ -1207,6 +1318,8 @@ class Daemon:
         self.power_source = select_power_source(cfg["power"])
         self.idle_source = (select_idle_source(cfg["idle"])
                             if cfg["idle"].get("enabled", True) else None)
+        self.media_source = (select_media_source(cfg["media"])
+                             if cfg["media"].get("enabled", True) else None)
         self.uploader = Uploader(cfg["upload"], self.log_dir, self.hostname,
                                  retention=cfg["retention"])
 
@@ -1318,10 +1431,13 @@ class Daemon:
             i = new_cfg["idle"]
             self.idle_source.timeout = float(i["timeout"])
             self.idle_source.mode = str(i["mode"])
+        if self.media_source is not None:
+            self.media_source.interval = float(new_cfg["media"]["interval"])
         detail = (f"heartbeat={int(self.heartbeat_interval)}s "
                   f"upload_interval={new_cfg['upload'].get('interval')}s "
                   f"proc_interval={new_cfg['processes'].get('interval')}s "
-                  f"idle_timeout={new_cfg['idle'].get('timeout')}s")
+                  f"idle_timeout={new_cfg['idle'].get('timeout')}s "
+                  f"media_interval={new_cfg['media'].get('interval')}s")
         self.writer.write("STATUS", ["config-reload", detail])
         logmsg(f"config reloaded (SIGHUP): {detail}")
 
@@ -1341,6 +1457,16 @@ class Daemon:
             self.writer.write("STATUS", ["idle-source-recovered", detail])
         else:
             self.writer.write("STATUS", ["idle-source-unavailable", detail])
+
+    # ---- MEDIA writing (R14) ----
+    def _on_media_event(self, fields: list):
+        self.writer.write("MEDIA", fields)
+
+    def _on_media_backend_status(self, up: bool, detail: str):
+        if up:
+            self.writer.write("STATUS", ["media-source-recovered", detail])
+        else:
+            self.writer.write("STATUS", ["media-source-unavailable", detail])
 
     def _startup_power(self):
         # Classify how the PREVIOUS session ended, BEFORE writing anything this run.
@@ -1457,6 +1583,9 @@ class Daemon:
             # idle/active are presence events -> same POWER writer as power events
             self.idle_source.on_event = self._on_power_event
             self.idle_source.on_backend_status = self._on_idle_backend_status
+        if self.media_source is not None:
+            self.media_source.on_event = self._on_media_event
+            self.media_source.on_backend_status = self._on_media_backend_status
 
         # seed current focus so the first heartbeat has data promptly
         try:
@@ -1469,6 +1598,8 @@ class Daemon:
             self._spawn(self.power_source.start, "power-source")
         if self.idle_source is not None:
             self._spawn(self.idle_source.start, "idle-source")
+        if self.media_source is not None:
+            self._spawn(self.media_source.start, "media-source")
         self._spawn(self._ticker, "ticker", pass_stop=False)
         if self.cfg["processes"].get("enabled", True):
             self._spawn(self._process_loop, "processes", pass_stop=False)
@@ -1532,6 +1663,14 @@ def select_idle_source(idle_cfg: dict) -> IdleSource | None:
         return WaylandIdleSource(timeout=idle_cfg.get("timeout", 300),
                                  mode=idle_cfg.get("mode", "inhibitor-aware"))
     # elif system == "Darwin": return MacIdleSource()  # future (IOHIDIdleTime)
+    return None
+
+
+def select_media_source(media_cfg: dict) -> MediaSource | None:
+    system = _platform.system()
+    if system == "Linux":
+        return MprisMediaSource(interval=media_cfg.get("interval", 5))
+    # elif system == "Darwin": return MacMediaSource()  # future (MediaRemote/nowplaying-cli)
     return None
 
 

@@ -59,6 +59,16 @@ R13. **User idle/presence qualification.** Log when the session goes input-idle 
     `mode` (`inhibitor-aware` default: a held idle inhibitor, e.g. video playback,
     counts as present; `input-only` uses protocol v2 raw input silence). Behind an
     `IdleSource` abstraction (R9; macOS later via IOHIDIdleTime).
+R14. **Now-playing media logging.** Record what media is playing via MPRIS2 on the
+    session D-Bus (the same machinery the DMS media widget reads). Covers every
+    conforming player — Spotify, VLC, mpv+plugin, and browsers (Chrome/Firefox register
+    `chromium.instance_*`/`firefox.instance_*` players for any HTML5 media, so
+    YouTube/Netflix/podcasts are captured, not just music). `MEDIA` lines carry
+    `player, status, artist, album, title, url`; written only on (status, track) change,
+    with a `Gone` status when a player leaves the bus so listening spans close from the
+    log alone. Polled via `busctl --json` (no new dependencies — user systemd is already
+    required). Configurable `[media] interval` (default 5s). Behind a `MediaSource`
+    abstraction (R9; macOS later via MediaRemote/nowplaying-cli).
 
 ## Target environment (initial client: `dgframework`)
 
@@ -122,6 +132,11 @@ Concretely, per an explicit 2026-07-17 decision by the user:
     availability problems emit `STATUS idle-source-unavailable/recovered`.
     `WAYLAND_DISPLAY` is recovered from the niri socket name when systemd didn't
     import the session env.
+  - **MediaSource** (`MprisMediaSource`): now-playing media via MPRIS2 on the session
+    D-Bus, polled with `busctl --json=short` (`ListNames` filtered to
+    `org.mpris.MediaPlayer2.*`, then `Properties.GetAll` per player). Emits `MEDIA`
+    lines on (status, track) change only; a player leaving the bus emits status `Gone`
+    (R14). Availability problems emit `STATUS media-source-unavailable/recovered`.
   - **ProcSampler**: top-N processes by CPU from `/proc`, top-style delta over a short
     window, on its own interval (R10). → `PROCS` lines.
   - **Uploader**: rsync over SSH (R5), network-resilient with backoff (R7), confirms via
@@ -139,7 +154,7 @@ Concretely, per an explicit 2026-07-17 decision by the user:
 - `config.example.toml`, `install.sh` (repo installer + systemd unit), `build-deploy.sh`
   (bundles everything into one self-contained deploy script for R3).
 
-Log line schema: `ISO8601±tz <TAB> {WINDOW|POWER|STATUS|PROCS} <TAB> …`.
+Log line schema: `ISO8601±tz <TAB> {WINDOW|POWER|STATUS|PROCS|MEDIA} <TAB> …`.
 - WINDOW: configured fields in order (title last of the standard fields; the optional
           `mux` column conventionally goes after title). Optional `mux` field (off by
           default; enabled by adding "mux" to `[capture] fields`): when the focused
@@ -164,6 +179,14 @@ Log line schema: `ISO8601±tz <TAB> {WINDOW|POWER|STATUS|PROCS} <TAB> …`.
           window-source-unavailable/recovered, power-source-unavailable,
           idle-source-unavailable/recovered.
 - PROCS:  space-joined `comm:pid:cpu%` tokens (optionally `:cmdline`).
+- MEDIA:  `player <TAB> status <TAB> artist <TAB> album <TAB> title <TAB> url`.
+          `player` is the MPRIS bus name minus the `org.mpris.MediaPlayer2.` prefix
+          (so browser players keep their `.instance_<N>` suffix). `status` is the MPRIS
+          PlaybackStatus (Playing/Paused/Stopped) or `Gone` (player left the bus; other
+          columns empty). Multi-artist tracks join with ", ". `url` is `xesam:url`
+          when the player provides one (Spotify track link, YouTube page URL, …).
+          Lines are change-triggered, not heartbeats: steady playback writes nothing,
+          so a track's span runs from its line to the player's next line.
 
 ## Requirement changes
 
@@ -209,6 +232,10 @@ Append dated entries here whenever scope shifts (newest last):
   opt-in via `[capture] fields`). herdr has no terminal-title option, so its socket
   API is queried; for tmux, `set -g set-titles on` remains the zero-config
   alternative. Enabled on dgpc's real config.
+- 2026-07-17 — Added R14 (now-playing media via MPRIS/session D-Bus, `MEDIA` lines,
+  change-triggered with `Gone` on player exit; `busctl --json` polling, default 5s).
+  Captures browser HTML5 playback (YouTube etc.), not just music players. Per design
+  philosophy, no player ignore-list — everything on the bus is logged.
 - 2026-07-17 — Multi-device deploy plan: chezmoi. `deploy/chezmoi/` manages config + unit as
   dotfiles and fetches the single-file daemon from GitHub via a chezmoi external (auto-update);
   a run_ hook does per-device keygen + restart-on-change. (User will roll this out later.)

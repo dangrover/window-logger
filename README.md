@@ -19,6 +19,7 @@ One file per host per day: `logs/<hostname>-YYYY-MM-DD.log`. Tab-separated lines
 2026-07-17T00:16:27-07:00	POWER	online	boot=2026-07-13T16:30:00-07:00
 2026-07-17T00:16:27-07:00	WINDOW	com.mitchellh.ghostty	260350	Build window logger
 2026-07-17T00:21:05-07:00	PROCS	claude:314134:12.0 chrome:325288:8.0 niri:872:4.0
+2026-07-17T00:18:11-07:00	MEDIA	spotify	Playing	Trudy and the Romance	Junkyard Jazz	Is There a Place I Can Go	https://open.spotify.com/track/1wR6F2NFDjBlDAYEHnAPS9
 2026-07-17T00:16:36-07:00	POWER	suspend
 2026-07-17T00:40:02-07:00	POWER	resume
 2026-07-17T08:04:04-07:00	STATUS	previous-session-unclean	last=2026-07-17T02:11:59-07:00
@@ -33,6 +34,7 @@ One file per host per day: `logs/<hostname>-YYYY-MM-DD.log`. Tab-separated lines
 | `POWER`  | `online` / `offline` / `suspend` / `resume` / `shutdown` / `lock` / `unlock` |
 | `STATUS` | anomalies an auditor should see (unclean prior shutdown, capture backend down) |
 | `PROCS`  | top-N processes by CPU as `comm:pid:cpu%` tokens |
+| `MEDIA`  | now-playing media (MPRIS): `player`, `status`, `artist`, `album`, `title`, `url` |
 
 Power + heartbeat lines let an auditor tell **on vs. off vs. asleep vs. crashed** apart
 from mere idle time. A crash leaves a heartbeat gap with no clean `offline`; the next boot
@@ -46,6 +48,10 @@ emits `STATUS previous-session-unclean`.
 - **Power**: via logind D-Bus signals (`gdbus monitor`, no root). Clean `offline` is written
   on SIGTERM (i.e. on logout/shutdown when systemd stops the service).
 - **Processes**: top-N by CPU sampled from `/proc` over a short window, every `interval`.
+- **Media**: now-playing info via MPRIS on the session D-Bus, polled every `[media]
+  interval` (default 5s). Covers Spotify, VLC, mpv+plugin, and browsers (any HTML5
+  playback — YouTube, Netflix, podcasts). Change-triggered: a line is written only when
+  a player's status or track changes; a player quitting writes a `Gone` line.
 
 ## Install (client)
 

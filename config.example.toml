@@ -62,6 +62,16 @@ timeout = 300
 #                    compositor; falls back to inhibitor-aware if unavailable).
 mode = "inhibitor-aware"
 
+[media]
+# Record now-playing media via MPRIS on the session D-Bus (what the DMS media widget
+# reads). Covers every conforming player: Spotify, VLC, mpv (with its MPRIS script),
+# and browsers -- Chrome/Firefox register a player whenever any HTML5 media plays,
+# so YouTube/Netflix/podcast playback is captured too. A MEDIA line is written only
+# when a player's (status, track) changes; a player quitting writes a "Gone" line.
+enabled = true
+# Seconds between MPRIS polls (bounds how precisely track changes are stamped).
+interval = 5
+
 [processes]
 # Periodically log the top-N processes by CPU (useful context alongside window focus).
 enabled = true
