@@ -47,6 +47,18 @@ log_lock_unlock = false
 # On startup, if the previous session didn't end with a clean offline/suspend/shutdown
 # marker, emit a STATUS "previous-session-unclean" line.
 detect_unclean_shutdown = true
+# Hold a logind sleep *delay* lock (via systemd-inhibit) so the "suspend" line is
+# written and fsynced before the session is frozen. Without it, a passive monitor can
+# be frozen before it sees PrepareForSleep, silently dropping suspend/resume events.
+# Delay mode is bounded by InhibitDelayMaxSec (~5s), so it can never block suspend.
+delay_inhibitor = true
+
+[network]
+# Watch NetworkManager for connectivity coming up so the uploader retries immediately
+# instead of waiting out its backoff. Best-effort; harmless if NetworkManager isn't the
+# network manager in use (the watcher just stays idle).
+enabled = true
+wake_on_connectivity = true
 
 [idle]
 # Record user presence via the Wayland ext-idle-notify protocol: a POWER "idle" line

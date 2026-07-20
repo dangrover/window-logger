@@ -125,7 +125,17 @@ Concretely, per an explicit 2026-07-17 decision by the user:
   - **PowerSource** (`LogindPowerSource`): reads `gdbus monitor --system` on
     `org.freedesktop.login1` (no root needed) for `PrepareForSleep` / `PrepareForShutdown`
     / session `Lock`/`Unlock`. Plus startup `online`/`boot` + unclean-shutdown detection
-    + SIGTERM → clean `offline`. → `POWER` / `STATUS` lines (R6).
+    + SIGTERM → clean `offline`. → `POWER` / `STATUS` lines (R6). Holds a logind sleep
+    **delay-inhibitor** (`systemd-inhibit --mode=delay`, `[power] delay_inhibitor`,
+    default on) so the `suspend` line is written+fsynced before the session is frozen —
+    a passive monitor alone can be frozen before it sees `PrepareForSleep`, dropping the
+    event. Released the instant the suspend line is durable; delay mode is bounded by
+    logind's InhibitDelayMaxSec (~5s) so it can never actually block a suspend.
+  - **NetworkMonitor**: `gdbus monitor --system` on `org.freedesktop.NetworkManager`,
+    watches `StateChanged` for full connectivity (state ≥ 70) and wakes the uploader so
+    it retries the moment the network returns instead of sitting out its backoff (R7).
+    Best-effort; idle if NetworkManager isn't in use. `[network] enabled` /
+    `wake_on_connectivity` (both default on).
   - **IdleSource** (`WaylandIdleSource`): user idle/active via `ext-idle-notify-v1`,
     spoken directly over the Wayland socket (pure stdlib wire client — niri advertises
     the protocol at v2; verified live). Emits `POWER idle`/`POWER active` (R13);
@@ -139,8 +149,14 @@ Concretely, per an explicit 2026-07-17 decision by the user:
     (R14). Availability problems emit `STATUS media-source-unavailable/recovered`.
   - **ProcSampler**: top-N processes by CPU from `/proc`, top-style delta over a short
     window, on its own interval (R10). → `PROCS` lines.
-  - **Uploader**: rsync over SSH (R5), network-resilient with backoff (R7), confirms via
-    `rsync -ni` dry-run and maintains `.upload-state.json` + `sent/` folder (R8).
+  - **Uploader**: rsync over SSH (R5), network-resilient with exponential backoff up to
+    `max_backoff` (R7), confirms via `rsync -ni` dry-run and maintains
+    `.upload-state.json` + `sent/` folder (R8). The upload loop waits on an
+    `upload_wake` event (not just the backoff timer): resume-from-suspend and
+    NetworkMonitor connectivity-up call `request_retry()` (clears the failure count) and
+    set the event, so a long backoff is cut short the moment connectivity is back —
+    important because the backoff timer uses CLOCK_MONOTONIC, which is frozen across
+    suspend and would otherwise leave the loop idle long after wake.
   - Backends selected by `platform` for future macOS support (R9).
   - `apply_env_overrides` makes every option settable via `WINDOW_LOGGER_<SECTION>_<KEY>`.
 - CLI subcommands: `run` (daemon), `snapshot` (one-shot test line), `upload` (force sync),
@@ -239,6 +255,17 @@ Append dated entries here whenever scope shifts (newest last):
 - 2026-07-17 — Multi-device deploy plan: chezmoi. `deploy/chezmoi/` manages config + unit as
   dotfiles and fetches the single-file daemon from GitHub via a chezmoi external (auto-update);
   a run_ hook does per-device keygen + restart-on-change. (User will roll this out later.)
+- 2026-07-20 — R7 hardening after a real stall on `dgframework`: an SSH/network outage
+  (rsync exit 255) drove uploads into the capped `max_backoff` (1h); the box then
+  suspended, freezing the CLOCK_MONOTONIC backoff timer, so after resume the upload loop
+  sat idle for hours despite connectivity being back. Fixes: (a) upload loop now waits on
+  an `upload_wake` event, cut short by **resume-from-suspend** and by a new
+  **NetworkMonitor** (NetworkManager `StateChanged` ≥ 70) — both call
+  `Uploader.request_retry()` to clear the backoff; (b) new `[network]` config section.
+  Also fixed a latent R6 gap found en route: suspend/resume were never landing in the
+  POWER log because the passive `gdbus` monitor gets frozen before it sees
+  `PrepareForSleep`; PowerSource now holds a logind sleep **delay-inhibitor**
+  (`[power] delay_inhibitor`) so the `suspend` line is durably written before freeze.
 
 ## Status
 

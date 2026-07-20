@@ -110,6 +110,13 @@ DEFAULTS = {
         "log_shutdown": True,
         "log_lock_unlock": False,      # off by default (noise/privacy)
         "detect_unclean_shutdown": True,
+        "delay_inhibitor": True,       # hold a logind sleep *delay* lock so the
+                                       # "suspend" line is written+fsynced before the
+                                       # session is frozen (reliable suspend/resume, R6)
+    },
+    "network": {
+        "enabled": True,               # watch NetworkManager for connectivity (R7)
+        "wake_on_connectivity": True,  # retry uploads the instant the network returns
     },
     "idle": {
         "enabled": True,               # log user idle/active transitions (R13)
@@ -511,11 +518,49 @@ class LogindPowerSource(PowerSource):
     LOCK_RE = re.compile(r"Session\.Lock \(\)")
     UNLOCK_RE = re.compile(r"Session\.Unlock \(\)")
 
-    def __init__(self, log_suspend_resume=True, log_shutdown=True, log_lock_unlock=False):
+    def __init__(self, log_suspend_resume=True, log_shutdown=True, log_lock_unlock=False,
+                 delay_inhibitor=True):
         super().__init__()
         self.log_suspend_resume = log_suspend_resume
         self.log_shutdown = log_shutdown
         self.log_lock_unlock = log_lock_unlock
+        # A logind sleep delay-lock keeps the session unfrozen long enough (up to
+        # InhibitDelayMaxSec, ~5s) for us to receive PrepareForSleep(true) and durably
+        # write the "suspend" line before the box actually sleeps. Without it a passive
+        # monitor can be frozen before the signal is handled, silently losing the event.
+        self.delay_inhibitor = delay_inhibitor and bool(shutil.which("systemd-inhibit"))
+        self._inhibitor = None
+
+    def _ensure_inhibitor(self):
+        """Hold a logind *delay* lock on sleep (idempotent). Delay mode is bounded by
+        InhibitDelayMaxSec, so a stuck lock can never block suspend for more than a few
+        seconds. No root and no new deps (systemd-inhibit ships with systemd)."""
+        if not self.delay_inhibitor:
+            return
+        if self._inhibitor is not None and self._inhibitor.poll() is None:
+            return  # already held
+        try:
+            self._inhibitor = subprocess.Popen(
+                ["systemd-inhibit", "--what=sleep", "--mode=delay",
+                 "--who=window-logger", "--why=record suspend/resume",
+                 "sleep", "infinity"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            logmsg(f"could not acquire sleep inhibitor: {e}")
+            self._inhibitor = None
+
+    def _release_inhibitor(self):
+        p, self._inhibitor = self._inhibitor, None
+        if p is None:
+            return
+        try:
+            p.terminate()
+            p.wait(timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            try:
+                p.kill()
+            except OSError:
+                pass
 
     def start(self, stop_event: threading.Event):
         if not shutil.which("gdbus"):
@@ -523,37 +568,48 @@ class LogindPowerSource(PowerSource):
             self.on_event("problem", "power-source-unavailable=gdbus-missing")
             return
         backoff = 1
-        while not stop_event.is_set():
-            try:
-                proc = subprocess.Popen(
-                    ["gdbus", "monitor", "--system", "--dest",
-                     "org.freedesktop.login1"],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-            except OSError as e:
-                logmsg(f"cannot start gdbus monitor: {e}")
-                stop_event.wait(min(backoff, 30))
-                backoff = min(backoff * 2, 30)
-                continue
-            backoff = 1
-            try:
-                for line in iter_lines(proc, stop_event):
-                    self._handle(line.strip())
-            except OSError as e:
-                logmsg(f"gdbus monitor read error: {e}")
-            finally:
+        try:
+            while not stop_event.is_set():
+                self._ensure_inhibitor()   # (re)arm before we start watching
                 try:
-                    proc.terminate()
-                    proc.wait(timeout=3)
-                except (OSError, subprocess.SubprocessError):
-                    proc.kill()
-            if not stop_event.is_set():
-                stop_event.wait(1)
+                    proc = subprocess.Popen(
+                        ["gdbus", "monitor", "--system", "--dest",
+                         "org.freedesktop.login1"],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                except OSError as e:
+                    logmsg(f"cannot start gdbus monitor: {e}")
+                    stop_event.wait(min(backoff, 30))
+                    backoff = min(backoff * 2, 30)
+                    continue
+                backoff = 1
+                try:
+                    for line in iter_lines(proc, stop_event):
+                        self._handle(line.strip())
+                except OSError as e:
+                    logmsg(f"gdbus monitor read error: {e}")
+                finally:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=3)
+                    except (OSError, subprocess.SubprocessError):
+                        proc.kill()
+                if not stop_event.is_set():
+                    stop_event.wait(1)
+        finally:
+            self._release_inhibitor()
 
     def _handle(self, line: str):
         m = self.SLEEP_RE.search(line)
         if m:
+            going_to_sleep = (m.group(1) == "true")
+            # on_event writes+fsyncs synchronously, so the line is durable before we let
+            # the suspend proceed by releasing the delay lock.
             if self.log_suspend_resume:
-                self.on_event("suspend" if m.group(1) == "true" else "resume", "")
+                self.on_event("suspend" if going_to_sleep else "resume", "")
+            if going_to_sleep:
+                self._release_inhibitor()   # unblock the pending suspend
+            else:
+                self._ensure_inhibitor()    # re-arm for the next sleep
             return
         m = self.SHUTDOWN_RE.search(line)
         if m and m.group(1) == "true":
@@ -565,6 +621,56 @@ class LogindPowerSource(PowerSource):
                 self.on_event("lock", "")
             elif self.UNLOCK_RE.search(line):
                 self.on_event("unlock", "")
+
+
+# --------------------------------------------------------------------------- #
+# Network connectivity watcher (R7) - wakes the uploader when the net returns
+# --------------------------------------------------------------------------- #
+
+class NetworkMonitor:
+    """Watches NetworkManager's StateChanged for connectivity coming up, so the uploader
+    can retry immediately instead of sitting out a long backoff. Best-effort: silently
+    idle if gdbus or NetworkManager is unavailable (e.g. iwd / systemd-networkd only).
+    Calls self.on_up() on each transition to full (global) connectivity."""
+
+    # NM_STATE_CONNECTED_GLOBAL = 70 (full connectivity); lower states are
+    # disconnected/connecting/local, which don't yet mean uploads can succeed.
+    STATE_RE = re.compile(r"NetworkManager\.StateChanged \(uint32 (\d+)\)")
+
+    def __init__(self, on_up=None):
+        self.on_up = on_up or (lambda: None)
+
+    def start(self, stop_event: threading.Event):
+        if not shutil.which("gdbus"):
+            return
+        backoff = 1
+        while not stop_event.is_set():
+            try:
+                proc = subprocess.Popen(
+                    ["gdbus", "monitor", "--system", "--dest",
+                     "org.freedesktop.NetworkManager"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            except OSError as e:
+                logmsg(f"cannot start NetworkManager monitor: {e}")
+                stop_event.wait(min(backoff, 30))
+                backoff = min(backoff * 2, 30)
+                continue
+            backoff = 1
+            try:
+                for line in iter_lines(proc, stop_event):
+                    m = self.STATE_RE.search(line)
+                    if m and int(m.group(1)) >= 70:
+                        self.on_up()
+            except OSError as e:
+                logmsg(f"NetworkManager monitor read error: {e}")
+            finally:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3)
+                except (OSError, subprocess.SubprocessError):
+                    proc.kill()
+            if not stop_event.is_set():
+                stop_event.wait(1)
 
 
 # --------------------------------------------------------------------------- #
@@ -1279,6 +1385,13 @@ class Uploader:
             return base
         return min(base * (2 ** min(self._failures, 8)), float(self.cfg["max_backoff"]))
 
+    def request_retry(self):
+        """Clear the failure backoff so the next upload cycle runs at the base interval.
+        Called when connectivity is restored (resume-from-suspend or network-up) so a
+        long backoff doesn't leave good connectivity unused (R7)."""
+        with self._lock:
+            self._failures = 0
+
 
 # --------------------------------------------------------------------------- #
 # Daemon orchestration
@@ -1299,6 +1412,7 @@ class Daemon:
         self.writer = LogWriter(self.log_dir, self.hostname)
         self.stop_event = threading.Event()
         self.reload_event = threading.Event()   # set by SIGHUP, serviced by the ticker
+        self.upload_wake = threading.Event()    # poke to retry upload out-of-band (R7)
 
         # capture state
         c = cfg["capture"]
@@ -1322,6 +1436,8 @@ class Daemon:
                              if cfg["media"].get("enabled", True) else None)
         self.uploader = Uploader(cfg["upload"], self.log_dir, self.hostname,
                                  retention=cfg["retention"])
+        self.network_monitor = (NetworkMonitor(on_up=self._on_connectivity_up)
+                                if cfg["network"].get("enabled", True) else None)
 
         self.mux_probe = MuxProbe()
 
@@ -1445,6 +1561,23 @@ class Daemon:
     def _on_power_event(self, event: str, detail: str):
         kind = "STATUS" if event == "problem" else "POWER"
         self.writer.write(kind, [event, detail])
+        if event == "resume":
+            # The monotonic backoff timer was frozen while asleep, so the upload loop
+            # would otherwise sit idle after waking. Kick it now that we're back (R7).
+            self._wake_uploader("resume")
+
+    def _wake_uploader(self, reason: str):
+        """Reset the upload backoff and interrupt the upload loop's wait so it retries
+        promptly (on resume-from-suspend or when connectivity returns)."""
+        if not self.cfg["upload"].get("enabled"):
+            return
+        self.uploader.request_retry()
+        self.upload_wake.set()
+        logmsg(f"upload retry triggered ({reason})")
+
+    def _on_connectivity_up(self):
+        if self.cfg["network"].get("wake_on_connectivity", True):
+            self._wake_uploader("network-up")
 
     def _on_window_backend_status(self, up: bool, detail: str):
         if up:
@@ -1549,7 +1682,11 @@ class Daemon:
             except Exception as e:  # noqa: BLE001 - keep daemon alive
                 logmsg(f"retention failed: {e}")
             wait_s = self.uploader.backoff_seconds()
-            if self.stop_event.wait(wait_s):
+            # Wait out the (possibly long) backoff, but let a resume / network-up event
+            # cut it short via upload_wake so we retry the moment connectivity is back.
+            self.upload_wake.wait(wait_s)
+            self.upload_wake.clear()
+            if self.stop_event.is_set():
                 break
 
     # ---- lifecycle ----
@@ -1557,6 +1694,7 @@ class Daemon:
         def stop_handler(signum, _frame):
             logmsg(f"received signal {signum}; shutting down")
             self.stop_event.set()
+            self.upload_wake.set()   # interrupt any in-progress backoff wait
         for s in (signal.SIGTERM, signal.SIGINT):
             signal.signal(s, stop_handler)
         # SIGHUP -> reload config (serviced by the ticker, not in the handler itself).
@@ -1604,6 +1742,8 @@ class Daemon:
         if self.cfg["processes"].get("enabled", True):
             self._spawn(self._process_loop, "processes", pass_stop=False)
         self._spawn(self._upload_loop, "upload", pass_stop=False)
+        if self.network_monitor is not None:
+            self._spawn(self.network_monitor.start, "network-monitor")
 
         # wait until stopped
         while not self.stop_event.wait(0.5):
@@ -1652,7 +1792,8 @@ def select_power_source(power_cfg: dict) -> PowerSource:
         return LogindPowerSource(
             log_suspend_resume=power_cfg.get("log_suspend_resume", True),
             log_shutdown=power_cfg.get("log_shutdown", True),
-            log_lock_unlock=power_cfg.get("log_lock_unlock", False))
+            log_lock_unlock=power_cfg.get("log_lock_unlock", False),
+            delay_inhibitor=power_cfg.get("delay_inhibitor", True))
     # elif system == "Darwin": return MacPowerSource()  # future (IOKit/pmset)
     return LogindPowerSource()  # best effort
 
